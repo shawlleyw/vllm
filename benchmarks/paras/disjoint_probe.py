@@ -3,7 +3,7 @@
 """Numerical oracle ONLY: keep independent weight copies, bypass live transfers.
 
 Imported as a diagnostic worker extension before model construction. This costs
-54 GiB of expert storage per rank and is never selected by the normal launcher.
+twice the steady expert storage per rank and is never selected by the normal launcher.
 """
 
 from dataclasses import replace

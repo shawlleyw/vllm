@@ -22,10 +22,61 @@ async def main(args):
                 args.url + path, json=body, headers={"X-data-parallel-rank": "0"}
             ) as r:
                 r.raise_for_status()
-                return await r.json()
+                raw = await r.text()
+                return json.loads(raw) if raw else None
 
         if not args.already_started:
             await post("/collective_rpc", {"method": "paras_logits_start"})
+        if args.history:
+            history = json.loads(Path(args.history).read_text())["tokens"]
+            assert len(history) == 32
+            prompt_ids = (
+                await post(
+                    "/tokenize",
+                    {
+                        "model": "paras-qwen",
+                        "prompt": "The capital of France is",
+                        "add_special_tokens": False,
+                    },
+                )
+            )["tokens"]
+            # Isolate numerical measurements from earlier diagnostic requests.
+            await post("/reset_prefix_cache", {})
+            parts, tokens = [], []
+            for step in range(32):
+                result = await post(
+                    "/v1/completions",
+                    {
+                        "model": "paras-qwen",
+                        "prompt": prompt_ids
+                        + [int(t.removeprefix("token_id:")) for t in history[:step]],
+                        "max_tokens": 1,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                        "logprobs": 5,
+                        "return_tokens_as_token_ids": True,
+                    },
+                )
+                choice = result["choices"][0]
+                parts.append(choice["text"])
+                tokens.extend(choice["logprobs"]["tokens"])
+            await post(
+                "/collective_rpc", {"method": "paras_logits_stop", "args": [str(out)]}
+            )
+            (out / "generation.json").write_text(
+                json.dumps(
+                    {
+                        "text": "".join(parts),
+                        "tokens": tokens,
+                        "history_tokens": history,
+                        "forced_history": True,
+                        "transition": None,
+                    },
+                    indent=2,
+                )
+            )
+            print(f"Captured 32 forced-history steps into {out}", flush=True)
+            return
         count = 0
         switched = False
         transition = None
@@ -75,6 +126,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://127.0.0.1:8765")
     p.add_argument("--output", required=True)
-    p.add_argument("--switch", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--history", help="generation.json providing forced input histories"
+    )
+    mode.add_argument("--switch", action="store_true")
     p.add_argument("--already-started", action="store_true")
     asyncio.run(main(p.parse_args()))

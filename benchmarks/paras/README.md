@@ -1,8 +1,9 @@
-# PARAS EP2 ↔ expert TP2 on vLLM V1
+# PARAS EP ↔ expert TP on vLLM V1
 
-This experimental two-GPU implementation keeps attention TP1/DP2, requests,
+This experimental implementation supports matching EP/TP sizes 2, 4, and 8
+on one node. It keeps attention TP1/DP, requests,
 prefix caching, and KV storage stationary while explicitly switching routed
-experts. The validated target is Qwen3-30B-A3B BF16 on A100 GPUs 6 and 7, based on
+experts. The original validated target is Qwen3-30B-A3B BF16 on two A100 GPUs, based on
 vLLM `2cf0a6915ce544dc493a0990f2ea38d81601128a` (v0.28.0).
 
 ## Environment
@@ -35,16 +36,16 @@ budget. There is no RDMA or multi-node transport in this milestone.
 Run servers sequentially and stop each foreground server with Ctrl-C:
 
 ```bash
-benchmarks/paras/launch_static.sh ep /data/shaoyuw/paras/vllm-milestone/runs/ep-new
-benchmarks/paras/launch_static.sh tp /data/shaoyuw/paras/vllm-milestone/runs/tp-new
+PARAS_GPUS=6,7 benchmarks/paras/launch_static.sh ep /data/shaoyuw/paras/vllm-milestone/runs/ep-new
+PARAS_GPUS=6,7 benchmarks/paras/launch_static.sh tp /data/shaoyuw/paras/vllm-milestone/runs/tp-new
 ```
 
 For each server, run the matching checks from another shell:
 
 ```bash
-.venv/bin/python benchmarks/paras/check_static.py --mode ep \
+.venv/bin/python benchmarks/paras/check_static.py --world-size 2 --mode ep \
   --output /data/shaoyuw/paras/vllm-milestone/runs/ep-new
-.venv/bin/python benchmarks/paras/verify_replay.py \
+.venv/bin/python benchmarks/paras/verify_replay.py --world-size 2 \
   /data/shaoyuw/paras/vllm-milestone/runs/ep-new
 ```
 
@@ -62,7 +63,7 @@ EP, and speculative decoding are disabled. GPU memory utilization is 0.85.
 ## Switching server
 
 ```bash
-benchmarks/paras/launch_paras.sh peer_access /data/shaoyuw/paras/vllm-milestone/runs/peer-new
+PARAS_GPUS=6,7 benchmarks/paras/launch_paras.sh peer_access /data/shaoyuw/paras/vllm-milestone/runs/peer-new
 # Use nccl instead of peer_access for the transfer baseline.
 ```
 
@@ -74,7 +75,7 @@ This adds:
 ```
 
 PARAS requires one API process to serialize control transactions. Its engine
-client broadcasts utility operations to **both** DP engines, including idle
+client broadcasts utility operations to **all** DP engines, including idle
 ranks. The model starts and finishes initialization in EP mode.
 
 ```bash
@@ -102,17 +103,18 @@ loading writes directly into EP views. Backend postprocessing must preserve
 addresses. Each layer has separate EP/TP experts, maps, prepare/finalize state,
 and kernels behind the same registered MoE wrapper and model router.
 
-The expert arena has 49 slabs of 576 MiB for 48 layers (27.5625 GiB per rank).
+For EP2/TP2 the expert arena has 49 slabs of 576 MiB for 48 layers
+(27.5625 GiB per rank). EP8/TP8 uses 49 slabs of 144 MiB (6.890625 GiB).
 EP layer `i` occupies slab `i`; TP layer `i` occupies slab `i+1`. EP→TP transfers
 run backward through layers; TP→EP runs forward. CUDA IPC uses the four weight
 kernels adapted from SGLang PARAS `8177b7260952e3d19cfe360196c31ebc96b3733a`, an
 explicit CUDA stream, and per-layer cross-rank completion fences. NCCL permutes
-into one preallocated pair of staging views, adding 576 MiB, then performs
+into one preallocated pair of staging views, adding one slab, then performs
 all-to-all. IPC mappings retain allocation-base offsets and are closed at teardown.
 Selected transports must initialize successfully; there is no silent fallback.
 
-Attention and KV allocations are outside the arena. Wider EP configurations are
-rejected: larger node-local TP replicas need a separately budgeted expert layout.
+Attention and KV allocations are outside the arena. Unequal EP/TP sizes are
+rejected: multiple TP replicas need a separately budgeted expert layout.
 The transfer group and expert topology are represented independently of attention
 TP. Runner hooks and model-layout metadata are isolated from the storage core.
 
@@ -126,9 +128,9 @@ existing graph-capture guard remains enabled after initialization.
 ```bash
 .venv/bin/python -m pytest --confcutdir=tests/model_executor/layers/fused_moe \
   tests/model_executor/layers/fused_moe -q
-.venv/bin/python benchmarks/paras/check_live.py \
+.venv/bin/python benchmarks/paras/check_live.py --world-size 2 \
   --output /data/shaoyuw/paras/vllm-milestone/runs/peer-new
-.venv/bin/python benchmarks/paras/verify_replay.py \
+.venv/bin/python benchmarks/paras/verify_replay.py --world-size 2 \
   /data/shaoyuw/paras/vllm-milestone/runs/peer-new
 ```
 
@@ -145,7 +147,7 @@ profiler traces independently verify CUDA runtime graph launches in both modes.
 With the server stopped and GPUs idle, run full-shape transport checks/benchmarks:
 
 ```bash
-benchmarks/paras/launch_transfer.sh peer_access \
+PARAS_GPUS=6,7 benchmarks/paras/launch_transfer.sh peer_access \
   /data/shaoyuw/paras/vllm-milestone/transfers/peer-new.json
 ```
 
@@ -163,7 +165,7 @@ are smoke benchmarks, not saturation or production capacity estimates.
 
 Launchers bind localhost and enable development RPC/profiling only for these
 experiments. Runner V2, automatic switching, quantization, other model layouts,
-multiple API processes, and multi-node/wider-EP execution remain outside this
+multiple API processes, multiple TP replicas, and multi-node execution remain outside this
 milestone.
 
 For a switched request, KV retains the arithmetic of earlier EP steps. Therefore
@@ -173,13 +175,14 @@ arithmetic difference and also requires **exact** agreement with a separate
 mixed-mode reference that never transfers weights during generation:
 
 ```bash
-PARAS_WORKER_EXTENSION=disjoint_probe.DisjointProbe \
+PARAS_GPUS=6,7 PARAS_WORKER_EXTENSION=disjoint_probe.DisjointProbe \
   benchmarks/paras/launch_paras.sh peer_access /data/shaoyuw/paras/vllm-milestone/runs/oracle-new
 .venv/bin/python benchmarks/paras/capture_logits.py --switch \
   --output /data/shaoyuw/paras/vllm-milestone/numerics/oracle-new
 ```
 
-The diagnostic extension reserves disjoint EP and TP weights (54 GiB per rank),
+The diagnostic extension reserves disjoint EP and TP weights
+(54 GiB per rank at size 2; 13.5 GiB at size 8),
 materializes TP once during initialization, and thereafter switches only the
 execution state. It is benchmark-only. Compare captures with:
 
@@ -198,3 +201,108 @@ The checker requires matching token histories and, for the oracle comparison,
 matching recorded expert-mode histories. Repeat for the NCCL captures. Reported
 p95 values use the nearest-rank percentile. Pre-commit hook environments and uv
 caches are configured beneath the conda prefix as well.
+
+## Eight GPUs
+
+Set `PARAS_GPUS=0,1,2,3,4,5,6,7` for EP8 ↔ TP8 with attention TP1/DP8.
+There is no implicit GPU selection or PARAS parallel size. Set `PARAS_GPUS=6,7`
+explicitly for two-rank reproductions. Launchers infer both
+DP size and expert TP size from this list and use one API process for comparable
+static and switching runs. Preflight checks require idle devices and successful
+CUDA context creation, since an idle GPU can still need driver recovery.
+
+Qwen3-30B-A3B's per-layer EP8 weights are `[16,1536,2048]` and
+`[16,2048,768]`; TP8 weights are `[128,192,2048]` and `[128,2048,96]`.
+The 96-channel Triton shape works on A100, including CUDA graph replay; a larger
+model is not required for shape compatibility. Check it independently with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python benchmarks/paras/check_tp_shape.py \
+  --output /data/shaoyuw/paras/vllm-eight-gpu/tp8-shape.json
+```
+
+`check_peer_indexing.py` additionally exercises the production eight-way transfer
+kernels against eight independent full-model arenas on one GPU (55.125 GiB).
+It verifies exact indexing and overwrite order, **not** IPC or distributed fences:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/usr/local/cuda-13.0 TORCH_CUDA_ARCH_LIST=8.0 \
+  .venv/bin/python benchmarks/paras/check_peer_indexing.py \
+  --output /data/shaoyuw/paras/vllm-eight-gpu/peer8-local-indexing.json
+```
+
+After stopping any server, run each transport sequentially:
+
+```bash
+PARAS_GPUS=0,1,2,3,4,5,6,7 benchmarks/paras/launch_transfer.sh peer_access \
+  /data/shaoyuw/paras/vllm-eight-gpu/transfer8-peer.json
+PARAS_GPUS=0,1,2,3,4,5,6,7 benchmarks/paras/launch_transfer.sh nccl \
+  /data/shaoyuw/paras/vllm-eight-gpu/transfer8-nccl.json
+```
+
+Run the static EP8 and TP8 gates sequentially before switching acceptance:
+
+```bash
+PARAS_GPUS=0,1,2,3,4,5,6,7 benchmarks/paras/launch_static.sh ep \
+  /data/shaoyuw/paras/vllm-eight-gpu/static8-ep
+# In another shell; repeat with mode tp and a static8-tp directory.
+.venv/bin/python benchmarks/paras/check_static.py --world-size 8 --mode ep \
+  --output /data/shaoyuw/paras/vllm-eight-gpu/static8-ep
+.venv/bin/python benchmarks/paras/verify_replay.py --world-size 8 \
+  /data/shaoyuw/paras/vllm-eight-gpu/static8-ep
+```
+
+Then run both switching transports sequentially:
+
+```bash
+PARAS_GPUS=0,1,2,3,4,5,6,7 benchmarks/paras/launch_paras.sh peer_access \
+  /data/shaoyuw/paras/vllm-eight-gpu/live8-peer
+# In another shell; repeat with transport nccl and a live8-nccl directory.
+.venv/bin/python benchmarks/paras/check_live.py --world-size 8 \
+  --output /data/shaoyuw/paras/vllm-eight-gpu/live8-peer
+.venv/bin/python benchmarks/paras/verify_replay.py --world-size 8 \
+  /data/shaoyuw/paras/vllm-eight-gpu/live8-peer
+```
+
+When BF16 reductions produce different greedy continuations, use
+`capture_logits.py --history /path/to/reference/generation.json` for each steady
+mode. This generates one token for each explicitly forced prefix and records
+input histories separately from sampled outputs. Use the same history and
+protocol for both static and PARAS captures. The numerical diagnostic resets
+prefix caching before measurement; the switch operation itself never does so.
+Mixed-mode live captures still use `--switch` without `--history` and require a
+disjoint oracle with matching recorded histories.
+
+The suites check all DP ranks, including uneven loads and idle ranks, with eight
+worker traces per captured mode. Logit capture and comparison commands above are
+unchanged. Four-rank checks use four GPU indices and `--world-size 4`.
+
+On September 8, 2026, full eight-GPU validation was blocked before model loading:
+GPU 1 rejected CUDA context creation and reported recovery action `Reset`,
+uncorrectable DRAM errors, and failed row remapping. A reset requires an
+administrator password unavailable in the session. Eight-rank storage tests and
+the standalone TP8 kernel and local eight-way transfer indexing checks pass.
+On healthy GPUs 4–7, both transports also pass static/live four-rank serving,
+graph replay, and matching-history steady-mode logits. This does **not** establish
+eight-rank serving correctness. Health diagnostics and available-device test results are
+under `/data/shaoyuw/paras/vllm-eight-gpu`.
+
+## Explicit four-GPU run
+
+No launcher or acceptance checker falls back to two ranks. `--paras-config`
+requires an explicit `expert_tp_size`; the launchers derive that value from the
+required `PARAS_GPUS` list. For the four-GPU run, use:
+
+```bash
+PARAS_GPUS=4,5,6,7 benchmarks/paras/launch_paras.sh peer_access \
+  /data/shaoyuw/paras/vllm-four-gpu-explicit
+# In another shell:
+.venv/bin/python benchmarks/paras/check_live.py --world-size 4 \
+  --output /data/shaoyuw/paras/vllm-four-gpu-explicit
+.venv/bin/python benchmarks/paras/verify_replay.py --world-size 4 \
+  /data/shaoyuw/paras/vllm-four-gpu-explicit
+```
+
+This explicitly selects attention TP1/DP4, EP4 at startup, and expert TP4 after
+switching. It passes `--data-parallel-size 4` and
+`--paras-config '{"expert_tp_size":4,"weight_transfer_method":"peer_access"}'`.

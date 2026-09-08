@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Two-rank BF16 DeepEP dispatch/combine round trip with CUDA graph replay."""
+"""Distributed BF16 DeepEP dispatch/combine round trip with CUDA graph replay."""
 
 import os
 
@@ -15,13 +15,14 @@ def main():
     dist.init_process_group("nccl", device_id=torch.device(f"cuda:{rank}"))
     cpu_group = dist.new_group(backend="gloo")
     torch.manual_seed(rank)
+    size = dist.get_world_size()
     hidden, experts, capacity = 2048, 128, 64
     buffer = deep_ep.Buffer(
         cpu_group,
         0,
-        deep_ep.Buffer.get_low_latency_rdma_size_hint(capacity, hidden, 2, experts),
+        deep_ep.Buffer.get_low_latency_rdma_size_hint(capacity, hidden, size, experts),
         low_latency_mode=True,
-        num_qps_per_rank=64,
+        num_qps_per_rank=experts // size,
         allow_nvlink_for_low_latency_mode=True,
         explicitly_destroy=True,
     )

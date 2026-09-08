@@ -11,9 +11,10 @@ import torch
 
 def read(directory):
     directory = Path(directory)
+    generation = json.loads((directory / "generation.json").read_text())
     return (
         torch.cat(torch.load(directory / "rank0.pt", weights_only=True)).float(),
-        json.loads((directory / "generation.json").read_text())["tokens"],
+        generation.get("history_tokens", generation["tokens"]),
         json.loads((directory / "rank0-modes.json").read_text()),
     )
 

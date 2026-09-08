@@ -105,7 +105,11 @@ class ParasRuntime:
     def __init__(self, config):
         self.config = config
         config.paras_config.validate(config)
-        layout = ExpertLayout.from_model(config.model_config.hf_config)
+        layout = ExpertLayout.from_model(
+            config.model_config.hf_config,
+            ep_size=config.parallel_config.data_parallel_size,
+            expert_tp_size=config.paras_config.expert_tp_size,
+        )
         self.arena = ExpertArena(layout, config.paras_config.weight_transfer_method)
         self.arena.materialize(
             torch.device("cuda", torch.accelerator.current_device_index())
@@ -130,8 +134,8 @@ class ParasRuntime:
         from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
         dp = get_dp_group()
-        # Expert topology is independent of attention TP. The two-rank milestone
-        # has one expert TP replica spanning both attention DP ranks.
+        # Expert topology is independent of attention TP. One expert TP group
+        # spans all attention DP ranks; attention and KV remain stationary.
         self.expert_ranks = tuple(dp.ranks)
         self.cpu_group = dp.cpu_group
         self.transfer_group = dist.new_group(
@@ -150,7 +154,7 @@ class ParasRuntime:
         tp_parallel = FusedMoEParallelConfig.make(
             tp_size_=1,
             pcp_size_=1,
-            dp_size_=2,
+            dp_size_=self.arena.layout.expert_tp_size,
             sp_size_=1,
             vllm_parallel_config=parallel,
         )

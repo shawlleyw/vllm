@@ -9,8 +9,8 @@ from vllm.config.utils import config, get_hash_factors, hash_factors
 class ParasConfig:
     """Explicit expert EP/TP switching with stationary attention and KV storage."""
 
-    expert_tp_size: Literal[2] = 2
-    """Ranks in each expert TP replica. The first milestone supports two ranks."""
+    expert_tp_size: Literal[2, 4, 8] | None = None
+    """Explicit expert TP ranks (2, 4, or 8); must equal the attention DP size."""
     weight_transfer_method: Literal["peer_access", "nccl"] = "peer_access"
     """Transport used to reshard the managed routed expert weights."""
 
@@ -23,6 +23,9 @@ class ParasConfig:
         import vllm.envs as envs
         from vllm.config.compilation import CUDAGraphMode
 
+        if self.expert_tp_size is None:
+            raise ValueError("PARAS requires an explicit expert_tp_size (2, 4, or 8)")
+
         p = vllm_config.parallel_config
         m = vllm_config.model_config
         s = vllm_config.scheduler_config
@@ -32,11 +35,11 @@ class ParasConfig:
                 and not p.data_parallel_external_lb
                 and not p.data_parallel_hybrid_lb
             ),
-            "attention TP1/DP2 on one node": (
+            "attention TP1 with matching DP/expert TP on one node": (
                 p.tensor_parallel_size == 1
-                and p.data_parallel_size == 2
+                and p.data_parallel_size == self.expert_tp_size
                 and p.pipeline_parallel_size == 1
-                and p.data_parallel_size_local == 2
+                and p.data_parallel_size_local == self.expert_tp_size
             ),
             "EP startup with DeepEP low latency": (
                 p.enable_expert_parallel and p.all2all_backend == "deepep_low_latency"

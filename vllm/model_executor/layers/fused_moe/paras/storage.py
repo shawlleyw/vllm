@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Aligned reservations and stable typed views, adapted from SGLang PARAS.
 
-Attention parameters and KV caches never belong to this arena. Wider EP layouts
-must explicitly budget their larger TP replicas before they can be supported.
+Attention parameters and KV caches never belong to this arena. Configurations
+with multiple TP replicas require a different expert arena budget.
 """
 
 from dataclasses import dataclass
@@ -22,15 +22,15 @@ class ExpertLayout:
     experts: int
     hidden: int
     intermediate: int
-    ep_size: int = 2
-    expert_tp_size: int = 2
+    ep_size: int
+    expert_tp_size: int
 
     def __post_init__(self):
         if min(self.layers, self.experts, self.hidden, self.intermediate) <= 0:
             raise ValueError("Expert dimensions must be positive")
-        if self.ep_size != 2 or self.expert_tp_size != 2:
+        if self.ep_size not in (2, 4, 8) or self.expert_tp_size != self.ep_size:
             raise ValueError(
-                "Only EP2/TP2 is implemented; larger replicas need a new plan"
+                "EP and expert TP must match at 2, 4, or 8; replicas need a new plan"
             )
         if self.experts % self.ep_size or self.intermediate % self.expert_tp_size:
             raise ValueError("Experts and intermediate width must divide their groups")
@@ -38,7 +38,7 @@ class ExpertLayout:
             raise ValueError("Peer transfer rows must be multiples of 16 bytes")
 
     @classmethod
-    def from_model(cls, hf_config):
+    def from_model(cls, hf_config, *, ep_size: int, expert_tp_size: int):
         if hf_config.model_type != "qwen3_moe":
             raise ValueError("No PARAS expert layout registered for this model")
         return cls(
@@ -46,6 +46,8 @@ class ExpertLayout:
             hf_config.num_experts,
             hf_config.hidden_size,
             hf_config.moe_intermediate_size,
+            ep_size=ep_size,
+            expert_tp_size=expert_tp_size,
         )
 
     def shapes(self, mode: str) -> tuple[tuple[int, ...], tuple[int, ...]]:

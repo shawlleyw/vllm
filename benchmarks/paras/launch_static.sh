@@ -11,7 +11,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 out=${2:-/data/shaoyuw/paras/vllm-milestone/runs/$mode}
 mkdir -p "$out"
 out=$(realpath "$out")
-export CUDA_VISIBLE_DEVICES=6,7
+export CUDA_VISIBLE_DEVICES="${PARAS_GPUS:?Set PARAS_GPUS explicitly, e.g. 4,5,6,7 for four ranks}"
+IFS=, read -ra paras_devices <<< "$CUDA_VISIBLE_DEVICES"
+paras_size=${#paras_devices[@]}
 export VLLM_USE_V2_MODEL_RUNNER=0
 export CUDA_HOME=/usr/local/cuda-13.0
 export OMP_NUM_THREADS=1
@@ -31,19 +33,10 @@ export VLLM_SERVER_DEV_MODE=1
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 nvidia-smi --query-gpu=index,uuid,name,memory.used,utilization.gpu --format=csv > "$out/gpus-before.csv"
-.venv/bin/python - <<'PY'
-import csv
-import subprocess
-rows = csv.reader(subprocess.check_output([
-    'nvidia-smi', '--query-gpu=index,memory.used,utilization.gpu',
-    '--format=csv,noheader,nounits'], text=True).splitlines())
-for index, memory, utilization in rows:
-    if int(index) in (6, 7) and (int(memory) > 128 or int(utilization) > 0):
-        raise SystemExit(f'GPU {index} is busy: {memory} MiB, {utilization}%')
-PY
+.venv/bin/python benchmarks/paras/check_gpus.py
 args=(/data/shaoyuw/models/Qwen3-30B-A3B
-  --host 127.0.0.1 --port 8765 --served-model-name paras-qwen
-  --dtype bfloat16 --tensor-parallel-size 1 --data-parallel-size 2
+  --host 127.0.0.1 --port 8765 --served-model-name paras-qwen --api-server-count 1
+  --dtype bfloat16 --tensor-parallel-size 1 --data-parallel-size "$paras_size"
   --data-parallel-backend mp --distributed-executor-backend mp
   --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 512
   --gpu-memory-utilization 0.85 --enable-chunked-prefill --enable-prefix-caching
@@ -58,7 +51,7 @@ args=(/data/shaoyuw/models/Qwen3-30B-A3B
   --cudagraph-metrics --seed 0)
 if [[ -n "${PARAS_TRANSPORT:-}" ]]; then
   [[ "$mode" == ep ]]
-  args+=(--paras-config "{\"expert_tp_size\":2,\"weight_transfer_method\":\"$PARAS_TRANSPORT\"}" --api-server-count 1)
+  args+=(--paras-config "{\"expert_tp_size\":$paras_size,\"weight_transfer_method\":\"$PARAS_TRANSPORT\"}")
 fi
 printf '%q ' .venv/bin/python -m vllm.entrypoints.cli.main serve "${args[@]}" "${experts[@]}" > "$out/command.txt"
 printf '\n' >> "$out/command.txt"

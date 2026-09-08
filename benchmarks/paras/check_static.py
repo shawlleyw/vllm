@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Exercise a static DP2 server and record the evidence needed by the gate."""
+"""Exercise a static DP server and record the evidence needed by the gate."""
 
 import argparse
 import asyncio
@@ -44,7 +44,9 @@ async def main(args):
                 "/collective_rpc", {"method": "paras_static_snapshot", "timeout": 60}
             )
             result = sorted(ranks(result), key=lambda x: x["dp_rank"])
-            assert [r["dp_rank"] for r in result] == [0, 1], result
+            assert [r["dp_rank"] for r in result] == list(range(args.world_size)), (
+                result
+            )
             return result
 
         async def generate(rank, prompt, tokens=64):
@@ -85,36 +87,53 @@ async def main(args):
             assert rank["runner"] == "vllm.v1.worker.gpu_model_runner", rank
             assert rank["graph_mode"] == "FULL_DECODE_ONLY", rank
             assert len(rank["attention_tp_ranks"]) == 1, rank
-            assert len(rank["attention_dp_ranks"]) == 2, rank
+            assert len(rank["attention_dp_ranks"]) == args.world_size, rank
             assert rank["counters"]["num_cudagraph_captured"] > 0, rank
             assert len(rank["layers"]) == 48, rank
             shapes = (
-                ([64, 1536, 2048], [64, 2048, 768])
+                (
+                    [128 // args.world_size, 1536, 2048],
+                    [128 // args.world_size, 2048, 768],
+                )
                 if args.mode == "ep"
-                else ([128, 768, 2048], [128, 2048, 384])
+                else (
+                    [128, 1536 // args.world_size, 2048],
+                    [128, 2048, 768 // args.world_size],
+                )
             )
             for layer in rank["layers"]:
                 assert (layer["w13_shape"], layer["w2_shape"]) == shapes, layer
                 parallel = layer["parallel"]
-                assert parallel["ep_size"] == (2 if args.mode == "ep" else 1)
-                assert parallel["tp_size"] == (1 if args.mode == "ep" else 2)
+                assert parallel["ep_size"] == (
+                    args.world_size if args.mode == "ep" else 1
+                )
+                assert parallel["tp_size"] == (
+                    1 if args.mode == "ep" else args.world_size
+                )
 
         prompt = "The capital of France is"
-        # Each rank must also make progress while the other has no requests.
-        idle = [await generate(rank, prompt, 24) for rank in (0, 1)]
-        assert "Paris" in idle[0]["response"]["choices"][0]["text"], idle
-        assert (
-            idle[0]["response"]["choices"][0]["text"]
-            == idle[1]["response"]["choices"][0]["text"]
-        ), idle
+        # Each rank must also make progress while all others have no requests.
+        idle = [await generate(rank, prompt, 24) for rank in range(args.world_size)]
+        assert all("Paris" in r["response"]["choices"][0]["text"] for r in idle), idle
+        # BF16 ReduceScatter can use different summation orders for each
+        # destination rank. Record continuation differences; numerical tests
+        # compare the same rank and explicitly matching input histories.
+        idle_texts = [r["response"]["choices"][0]["text"] for r in idle]
         started = time.perf_counter()
         uneven = await asyncio.gather(
             *(generate(0, f"Explain the integer {i}.") for i in range(8)),
-            *(generate(1, f"Explain the integer {i}.") for i in range(2)),
+            *(
+                generate(rank, f"Explain the integer {i}.")
+                for rank in range(1, args.world_size)
+                for i in range(1 + rank % 3)
+            ),
         )
         wall = time.perf_counter() - started
         chunked = await asyncio.gather(
-            *(generate(rank, "A short sentence. " * 400, 32) for rank in (0, 1))
+            *(
+                generate(rank, "A short sentence. " * 400, 32)
+                for rank in range(args.world_size)
+            )
         )
         after = await snapshot()
         (out / "after.json").write_text(json.dumps(after, indent=2))
@@ -133,13 +152,18 @@ async def main(args):
         durations = [r["seconds"] for r in uneven]
         result = {
             "mode": args.mode,
+            "world_size": args.world_size,
+            "idle_rank_continuations_identical": len(set(idle_texts)) == 1,
             "serving_checks": "passed",
             "graph_replay": "not profiled in this run"
             if args.skip_profile
             else "requires verification of profiles",
             "requests": idle + uneven + chunked,
             "profiled_request": profiled,
-            "uneven_batch_output_tokens_per_second": 640 / wall,
+            "uneven_batch_output_tokens_per_second": sum(
+                r["response"]["usage"]["completion_tokens"] for r in uneven
+            )
+            / wall,
             "uneven_request_latency_median_seconds": float(np.median(durations)),
             "uneven_request_latency_p95_seconds": float(np.percentile(durations, 95)),
         }
@@ -158,6 +182,7 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--world-size", type=int, choices=(2, 4, 8), required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8765")
     parser.add_argument("--mode", required=True, choices=("ep", "tp"))
     parser.add_argument("--output", required=True)

@@ -50,7 +50,8 @@ def main():
     torch.accelerator.set_device_index(rank)
     dist.init_process_group("gloo")
     gpu_group = dist.new_group(backend="nccl")
-    layout = ExpertLayout(args.layers, 128, 2048, 768)
+    size = dist.get_world_size()
+    layout = ExpertLayout(args.layers, 128, 2048, 768, size, size)
     arena = ExpertArena(layout, args.method)
     arena.materialize(f"cuda:{rank}")
     transfer = WeightTransfer(arena, args.method, dist.group.WORLD, gpu_group)
@@ -58,7 +59,15 @@ def main():
         for weight in ("w13", "w2"):
             target = arena.view(f"ep.{layer}.{weight}")
             target.copy_(
-                pattern(target.shape, layer, weight, rank * 64, 0, "ep", target.device)
+                pattern(
+                    target.shape,
+                    layer,
+                    weight,
+                    rank * (layout.experts // size),
+                    0,
+                    "ep",
+                    target.device,
+                )
             )
     torch.accelerator.synchronize()
     pointers = {k: v.data_ptr() for k, v in arena.views.items()}
@@ -75,8 +84,8 @@ def main():
                             target.shape,
                             layer,
                             weight,
-                            rank * 64 if mode == "ep" else 0,
-                            rank * 384 if mode == "tp" else 0,
+                            rank * (layout.experts // size) if mode == "ep" else 0,
+                            rank * (layout.intermediate // size) if mode == "tp" else 0,
                             mode,
                             target.device,
                         )
@@ -93,6 +102,7 @@ def main():
     assert pointers == {k: v.data_ptr() for k, v in arena.views.items()}
     results = {
         "rank": rank,
+        "world_size": size,
         "method": args.method,
         "layers": args.layers,
         "arena_bytes": arena.nbytes,
@@ -110,7 +120,7 @@ def main():
             for mode, t in times.items()
         },
     }
-    all_results = [None, None]
+    all_results = [None] * size
     dist.all_gather_object(all_results, results)
     if rank == 0:
         args.output.parent.mkdir(parents=True, exist_ok=True)

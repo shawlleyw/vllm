@@ -14,6 +14,7 @@ import regex as re
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--world-size", type=int, choices=(2, 4, 8), required=True)
     parser.add_argument("run", type=Path)
     args = parser.parse_args()
     traces = sorted((args.run / "profiles").glob("*.pt.trace.json*"))
@@ -30,7 +31,8 @@ def main():
                         counts[name] += 1
         if counts:
             evidence.append({"trace": trace.name, "cuda_graph_calls": dict(counts)})
-    expected = 4 if (args.run / "live.json").exists() else 2
+    live = (args.run / "live.json").exists()
+    expected = args.world_size * (2 if live else 1)
     assert len(evidence) == expected, (
         f"Expected {expected} worker traces, got {evidence}"
     )
@@ -39,15 +41,15 @@ def main():
         for rank in evidence
         if (match := re.match(r"dp(\d+)_", rank["trace"]))
     }
-    assert observed_ranks == {0, 1}, evidence
+    assert observed_ranks == set(range(args.world_size)), evidence
     for rank in evidence:
         calls = rank["cuda_graph_calls"]
         assert sum(v for k, v in calls.items() if "GraphLaunch" in k) > 0, rank
         assert not any("GraphInstantiate" in k for k in calls), rank
     (args.run / "replay.json").write_text(json.dumps(evidence, indent=2))
-    result_path = args.run / ("live.json" if expected == 4 else "results.json")
+    result_path = args.run / ("live.json" if live else "results.json")
     results = json.loads(result_path.read_text())
-    results["graph_replay"] = "passed: both workers launch existing CUDA graphs"
+    results["graph_replay"] = "passed: all workers launch existing CUDA graphs"
     result_path.write_text(json.dumps(results, indent=2))
     print(json.dumps(evidence, indent=2))
 

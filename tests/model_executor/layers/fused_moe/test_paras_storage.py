@@ -12,9 +12,10 @@ import torch
 from vllm.model_executor.layers.fused_moe.paras.storage import ExpertArena, ExpertLayout
 
 
+@pytest.mark.parametrize("size", [2, 4, 8])
 @pytest.mark.parametrize("method", ["nccl", "peer_access"])
-def test_arena_preserves_unread_sources_and_bounds(method):
-    layout = ExpertLayout(4, 8, 32, 16)
+def test_arena_preserves_unread_sources_and_bounds(method, size):
+    layout = ExpertLayout(4, 8, 32, 64, size, size)
     arena = ExpertArena(layout, method)
     assert arena.nbytes == (5 + (method == "nccl")) * arena.slab_bytes
     arena.materialize("cpu", arena.nbytes)
@@ -40,11 +41,12 @@ def test_arena_preserves_unread_sources_and_bounds(method):
         arena.view("ep.0.w13", (1,))
 
 
-def test_actual_qwen_shape_budget_and_replica_guard():
-    arena = ExpertArena(ExpertLayout(48, 128, 2048, 768), "peer_access")
-    assert arena.slab_bytes == 576 * 2**20
-    assert arena.nbytes == 49 * 576 * 2**20
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_actual_qwen_shape_budget_and_replica_guard(size):
+    arena = ExpertArena(ExpertLayout(48, 128, 2048, 768, size, size), "peer_access")
+    assert arena.slab_bytes == (1152 // size) * 2**20
+    assert arena.nbytes == 49 * (1152 // size) * 2**20
     with pytest.raises(ValueError, match="budget"):
         arena.materialize("cpu", arena.nbytes - 1)
     with pytest.raises(ValueError, match="replicas"):
-        ExpertLayout(48, 128, 2048, 768, ep_size=4)
+        ExpertLayout(48, 128, 2048, 768, ep_size=4, expert_tp_size=2)

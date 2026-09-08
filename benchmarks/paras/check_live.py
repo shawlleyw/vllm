@@ -40,7 +40,9 @@ async def main(args):
 
         async def snapshot():
             data = await post("/collective_rpc", {"method": "paras_static_snapshot"})
-            return sorted(ranks(data), key=lambda r: r["dp_rank"])
+            result = sorted(ranks(data), key=lambda r: r["dp_rank"])
+            assert [r["dp_rank"] for r in result] == list(range(args.world_size))
+            return result
 
         async def generate(rank, prompt, tokens, seen=None, label=""):
             body = {
@@ -119,7 +121,7 @@ async def main(args):
             return result
 
         await switch("ep")
-        # Each destination mode must make progress while the other rank is idle.
+        # Each destination mode must make progress while all other ranks are idle.
         for target in ("tp", "ep"):
             await switch(target)
             await switch(target)
@@ -141,9 +143,10 @@ async def main(args):
         ]
         tasks += [
             asyncio.create_task(
-                generate(1, f"Explain number {i}.", 144, label=f"uneven-{i}")
+                generate(rank, f"Explain number {i}.", 144, label=f"uneven-{rank}-{i}")
             )
-            for i in range(3)
+            for rank in range(1, args.world_size)
+            for i in range(1 + rank % 3)
         ]
         await asyncio.wait_for(first_tokens.wait(), 120)
         active_counts = []
@@ -166,14 +169,22 @@ async def main(args):
                     f"prefill-{rank}",
                 )
             )
-            for rank in (0, 1)
+            for rank in range(args.world_size)
         ]
         await asyncio.sleep(0.03)
         prefill_before_first_token = not first_prefill_tokens.is_set()
-        await switch("tp")
-        await switch("ep")
+        prefill_switches = [await switch("tp"), await switch("ep")]
         requests.extend(await asyncio.gather(*tasks))
         assert prefill_before_first_token
+        prefill_active = [
+            sum(
+                0 < request["computed_tokens"] < request["prompt_tokens"]
+                for rank in transition["requests_at_pause"]
+                for request in rank
+            )
+            for transition in prefill_switches
+        ]
+        assert any(prefill_active), "No switch overlapped partial prefill"
 
         # Cancelling a generation request while peers continue must not poison
         # future scheduling or consume a request twice after a switch.
@@ -249,10 +260,12 @@ async def main(args):
         result = {
             "passed": True,
             "transport": initial["transport"],
+            "world_size": args.world_size,
             "completed_requests": len(requests),
             "cancelled_requests": 1,
             "active_requests_at_switch": active_counts,
             "prefill_before_first_token": prefill_before_first_token,
+            "prefill_active_at_switch": prefill_active,
             "transitions": transitions,
             "requests": requests,
             "timings_ms": summary,
@@ -273,6 +286,7 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--world-size", type=int, choices=(2, 4, 8), required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8765")
     parser.add_argument("--output", required=True)
     asyncio.run(main(parser.parse_args()))
