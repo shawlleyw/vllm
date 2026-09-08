@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Literal
+
+from vllm.config.utils import config, get_hash_factors, hash_factors
+
+
+@config
+class ParasConfig:
+    """Explicit expert EP/TP switching with stationary attention and KV storage."""
+
+    expert_tp_size: Literal[2] = 2
+    """Ranks in each expert TP replica. The first milestone supports two ranks."""
+    weight_transfer_method: Literal["peer_access", "nccl"] = "peer_access"
+    """Transport used to reshard the managed routed expert weights."""
+
+    def compute_hash(self) -> str:
+        return hash_factors(get_hash_factors(self, set()))
+
+    def validate(self, vllm_config) -> None:
+        import torch
+
+        import vllm.envs as envs
+        from vllm.config.compilation import CUDAGraphMode
+
+        p = vllm_config.parallel_config
+        m = vllm_config.model_config
+        s = vllm_config.scheduler_config
+        requirements = {
+            "one API process and internal DP load balancing": (
+                p._api_process_count == 1
+                and not p.data_parallel_external_lb
+                and not p.data_parallel_hybrid_lb
+            ),
+            "attention TP1/DP2 on one node": (
+                p.tensor_parallel_size == 1
+                and p.data_parallel_size == 2
+                and p.pipeline_parallel_size == 1
+                and p.data_parallel_size_local == 2
+            ),
+            "EP startup with DeepEP low latency": (
+                p.enable_expert_parallel and p.all2all_backend == "deepep_low_latency"
+            ),
+            "batched Triton EP experts": (
+                vllm_config.kernel_config.moe_backend == "batched_triton"
+            ),
+            "BF16 Qwen3 MoE": (
+                m is not None
+                and m.dtype == torch.bfloat16
+                and m.hf_config.model_type == "qwen3_moe"
+                and m.quantization is None
+            ),
+            "V1 model runner": not envs.VLLM_USE_V2_MODEL_RUNNER,
+            "synchronous scheduling": not s.async_scheduling,
+            "no DBO/EPLB/elastic EP": not (
+                p.enable_dbo or p.enable_eplb or p.enable_elastic_ep
+            ),
+            "no speculative decoding or LoRA": (
+                vllm_config.speculative_config is None
+                and vllm_config.lora_config is None
+            ),
+            "full decode graphs": (
+                not m.enforce_eager
+                and vllm_config.compilation_config.cudagraph_mode
+                == CUDAGraphMode.FULL_DECODE_ONLY
+            ),
+        }
+        failures = [name for name, valid in requirements.items() if not valid]
+        if failures:
+            raise ValueError("PARAS requires " + ", ".join(failures))

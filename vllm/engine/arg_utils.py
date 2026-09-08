@@ -102,6 +102,7 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
+from vllm.config.paras import ParasConfig
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
@@ -674,6 +675,7 @@ class EngineArgs:
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
+    paras_config: ParasConfig | None = None
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
@@ -768,6 +770,8 @@ class EngineArgs:
             self.attention_config = AttentionConfig(**self.attention_config)
         if isinstance(self.mamba_config, dict):
             self.mamba_config = MambaConfig(**self.mamba_config)
+        if isinstance(self.paras_config, dict):
+            self.paras_config = ParasConfig(**self.paras_config)
         if isinstance(self.kernel_config, dict):
             self.kernel_config = KernelConfig(**self.kernel_config)
         if isinstance(self.ec_manager_config, dict):
@@ -1642,6 +1646,7 @@ class EngineArgs:
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
+        vllm_group.add_argument("--paras-config", **vllm_kwargs["paras_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
@@ -2508,6 +2513,7 @@ class EngineArgs:
             offload_config=offload_config,
             attention_config=attention_config,
             mamba_config=mamba_config,
+            paras_config=self.paras_config,
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,

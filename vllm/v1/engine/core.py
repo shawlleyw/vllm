@@ -2216,7 +2216,10 @@ class DPEngineCoreProc(EngineCoreProc):
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        # PARAS needs a bounded quiescence point after the current execution.
+        # All ranks use the same fixed cadence, including idle/dummy steps.
+        sync_interval = 1 if self.vllm_config.paras_config is not None else 32
+        if self.step_counter % sync_interval != 0:
             return True
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(

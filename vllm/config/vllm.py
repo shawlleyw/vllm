@@ -21,6 +21,7 @@ import torch
 from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
+from vllm.config.paras import ParasConfig
 from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
@@ -349,6 +350,8 @@ class VllmConfig:
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
     """Kernel configuration."""
+    paras_config: ParasConfig | None = None
+    """Explicit routed expert EP/TP switching configuration."""
     lora_config: LoRAConfig | None = None
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
@@ -498,6 +501,8 @@ class VllmConfig:
             vllm_factors.append(self.compilation_config.compute_hash())
         else:
             vllm_factors.append("None")
+        if self.paras_config:
+            vllm_factors.append(self.paras_config.compute_hash())
         if self.kernel_config:
             vllm_factors.append(self.kernel_config.compute_hash())
         else:

@@ -106,6 +106,11 @@ class ServeSubcommand(CLISubcommand):
         # - External LB: 1 (external LB handles distribution)
         # - Hybrid LB: Use local DP size (internal LB for local ranks only)
         # - Internal LB: Use full DP size
+        if getattr(args, "paras_config", None) is not None:
+            if args.api_server_count not in (None, 1):
+                raise ValueError("PARAS requires one API process to serialize switches")
+            args.api_server_count = 1
+
         if args.api_server_count is None:
             if is_multi_port or is_external_lb or rust_frontend_path:
                 args.api_server_count = 1

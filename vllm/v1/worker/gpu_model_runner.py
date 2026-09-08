@@ -4291,6 +4291,10 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if self.vllm_config.paras_config is not None and self.paras.failed:
+            raise RuntimeError(
+                "PARAS expert storage is invalid; engine restart required"
+            )
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -5499,6 +5503,10 @@ class GPUModelRunner(
                     )
                     eplb_models += 1
 
+                if self.vllm_config.paras_config is not None:
+                    from vllm.v1.worker.paras_adapter import initialize
+
+                    self.paras = initialize(self.model)
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
@@ -6556,6 +6564,13 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        from vllm.v1.worker.paras_adapter import profile_both
+
+        if self.vllm_config.paras_config is not None:
+            return profile_both(self, self._profile_run_single)
+        return self._profile_run_single()
+
+    def _profile_run_single(self) -> None:
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -6697,6 +6712,9 @@ class GPUModelRunner(
             BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
         self.compilation_config.static_forward_context.clear()
+        if hasattr(self, "paras"):
+            self.paras.shutdown()
+            del self.paras
         self.model = None  # type: ignore[assignment]
         _ROPE_DICT.clear()
 
@@ -6778,6 +6796,13 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        from vllm.v1.worker.paras_adapter import profile_both
+
+        if self.vllm_config.paras_config is not None:
+            return profile_both(self, self._profile_cudagraph_memory_single)
+        return self._profile_cudagraph_memory_single()
+
+    def _profile_cudagraph_memory_single(self) -> int:
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -6947,6 +6972,13 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        from vllm.v1.worker.paras_adapter import capture_both
+
+        if self.vllm_config.paras_config is not None:
+            return capture_both(self)
+        return self._capture_model_single()
+
+    def _capture_model_single(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "

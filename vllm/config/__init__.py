@@ -35,6 +35,7 @@ from vllm.config.offload import (
     UVAOffloadConfig,
 )
 from vllm.config.parallel import EPLBConfig, ParallelConfig
+from vllm.config.paras import ParasConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.config.profiler import ProfilerConfig
 from vllm.config.reasoning import ReasoningConfig
@@ -64,6 +65,7 @@ from vllm.config.weight_transfer import WeightTransferConfig
 # __all__ should only contain classes and functions.
 # Types and globals should be imported from their respective modules.
 __all__ = [
+    "ParasConfig",
     # From vllm.config.attention
     "AttentionConfig",
     # From vllm.config.cache

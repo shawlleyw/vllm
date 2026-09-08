@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Live PARAS acceptance: queued/prefill/decode/idle/cancellation and replay."""
+
+import argparse
+import asyncio
+import contextlib
+import json
+import math
+import statistics
+import time
+from pathlib import Path
+
+import aiohttp
+from check_static import ranks
+
+
+async def main(args):
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=600)
+    ) as client:
+
+        async def post(path, body=None, rank=None):
+            async with client.post(
+                args.url + path,
+                json=body,
+                headers={} if rank is None else {"X-data-parallel-rank": str(rank)},
+            ) as r:
+                text = await r.text()
+                if r.status != 200:
+                    raise RuntimeError(f"{path}: HTTP {r.status}: {text}")
+                return json.loads(text) if text else None
+
+        async def status():
+            async with client.get(args.url + "/paras/status") as r:
+                r.raise_for_status()
+                return await r.json()
+
+        async def snapshot():
+            data = await post("/collective_rpc", {"method": "paras_static_snapshot"})
+            return sorted(ranks(data), key=lambda r: r["dp_rank"])
+
+        async def generate(rank, prompt, tokens, seen=None, label=""):
+            body = {
+                "model": "paras-qwen",
+                "prompt": prompt,
+                "max_tokens": tokens,
+                "temperature": 0,
+                "ignore_eos": True,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "logprobs": 5,
+                "return_tokens_as_token_ids": True,
+            }
+            started = time.perf_counter()
+            text, ids, logprobs = "", set(), []
+            usage = None
+            finished = 0
+            async with client.post(
+                args.url + "/v1/completions",
+                json=body,
+                headers={"X-data-parallel-rank": str(rank)},
+            ) as r:
+                r.raise_for_status()
+                async for line in r.content:
+                    if (
+                        not line.startswith(b"data: ")
+                        or line.strip() == b"data: [DONE]"
+                    ):
+                        continue
+                    event = json.loads(line[6:])
+                    ids.add(event["id"])
+                    if event.get("usage"):
+                        usage = event["usage"]
+                    for choice in event["choices"]:
+                        text += choice["text"]
+                        if choice.get("logprobs"):
+                            logprobs.extend(choice["logprobs"]["tokens"])
+                        finished += choice.get("finish_reason") == "length"
+                        if seen is not None and len(logprobs) >= 4:
+                            seen.set()
+            assert usage and usage["completion_tokens"] == tokens, (label, usage)
+            assert finished == 1 and len(ids) == 1, (label, ids, finished)
+            assert len(logprobs) == tokens, (label, len(logprobs))
+            return {
+                "label": label,
+                "rank": rank,
+                "id": ids.pop(),
+                "text": text,
+                "tokens": logprobs,
+                "usage": usage,
+                "seconds": time.perf_counter() - started,
+            }
+
+        for _ in range(300):
+            try:
+                initial = await status()
+                break
+            except (aiohttp.ClientError, OSError):
+                await asyncio.sleep(2)
+        else:
+            raise TimeoutError("PARAS server did not initialize")
+        assert initial["mode"] == "ep" and initial["epoch"] == 0
+        before = await snapshot()
+        (out / "before.json").write_text(json.dumps(before, indent=2))
+        transitions, requests = [], []
+        epoch = 0
+
+        async def switch(target):
+            nonlocal epoch
+            previous = await status()
+            result = await post("/paras/switch", {"target": target})
+            epoch += previous["mode"] != target
+            assert result["mode"] == target and result["epoch"] == epoch, result
+            assert result["noop"] == (previous["mode"] == target), result
+            transitions.append(result)
+            return result
+
+        await switch("ep")
+        # Each destination mode must make progress while the other rank is idle.
+        for target in ("tp", "ep"):
+            await switch(target)
+            await switch(target)
+            requests.append(
+                await generate(
+                    0, "The capital of France is", 24, label=f"idle-{target}"
+                )
+            )
+            assert "Paris" in requests[-1]["text"]
+
+        # More than 64 rank-0 requests guarantees queueing. A streaming token
+        # event establishes that switching occurs during decode, not beforehand.
+        first_tokens = asyncio.Event()
+        tasks = [
+            asyncio.create_task(
+                generate(0, f"Explain integer {i}.", 96, first_tokens, f"queued-{i}")
+            )
+            for i in range(70)
+        ]
+        tasks += [
+            asyncio.create_task(
+                generate(1, f"Explain number {i}.", 144, label=f"uneven-{i}")
+            )
+            for i in range(3)
+        ]
+        await asyncio.wait_for(first_tokens.wait(), 120)
+        active_counts = []
+        for target in ("tp", "ep", "tp", "ep"):
+            active_counts.append(sum(not t.done() for t in tasks))
+            await switch(target)
+        assert active_counts[0] > 0, active_counts
+        requests.extend(await asyncio.gather(*tasks))
+
+        # Large distinct prompts, above the scheduling budget, keep prefill
+        # chunks active. Confirm a request is still waiting for its first tokens.
+        first_prefill_tokens = asyncio.Event()
+        tasks = [
+            asyncio.create_task(
+                generate(
+                    rank,
+                    f"Document {rank}: " + "A different short sentence. " * 1000,
+                    96,
+                    first_prefill_tokens,
+                    f"prefill-{rank}",
+                )
+            )
+            for rank in (0, 1)
+        ]
+        await asyncio.sleep(0.03)
+        prefill_before_first_token = not first_prefill_tokens.is_set()
+        await switch("tp")
+        await switch("ep")
+        requests.extend(await asyncio.gather(*tasks))
+        assert prefill_before_first_token
+
+        # Cancelling a generation request while peers continue must not poison
+        # future scheduling or consume a request twice after a switch.
+        cancel_seen = asyncio.Event()
+        cancelled = asyncio.create_task(
+            generate(0, "Write a very long story.", 2048, cancel_seen, "cancelled")
+        )
+        survivor_seen = asyncio.Event()
+        survivor = asyncio.create_task(
+            generate(1, "Count the positive integers.", 256, survivor_seen, "survivor")
+        )
+        await asyncio.wait_for(cancel_seen.wait(), 120)
+        cancelled.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancelled
+        await switch("tp")
+        requests.append(await survivor)
+        await switch("ep")
+        settled = await snapshot()
+        # Repeated idle transitions detect continuing allocation growth and
+        # produce transport/switch timing samples under identical conditions.
+        idle_start = len(transitions)
+        for _ in range(12):
+            await switch("tp")
+            await switch("ep")
+        idle_samples = transitions[idle_start:]
+        after = await snapshot()
+        (out / "after.json").write_text(json.dumps(after, indent=2))
+        (out / "settled.json").write_text(json.dumps(settled, indent=2))
+        for first, warm, last in zip(before, settled, after):
+            assert first["attention_tp_ranks"] == last["attention_tp_ranks"]
+            assert first["attention_dp_ranks"] == last["attention_dp_ranks"]
+            assert first["kv_addresses"] == last["kv_addresses"], "KV moved"
+            assert first["all_weight_addresses"] == last["all_weight_addresses"]
+            assert first["counters"] == last["counters"], (
+                "Compilation/capture after init"
+            )
+            assert warm["memory_allocated"] == last["memory_allocated"], "Memory growth"
+            assert warm["memory_reserved"] == last["memory_reserved"], "Reserved growth"
+            assert last["paras"]["graphs"] == {"ep": 7, "tp": 7}
+            assert all(
+                last["paras"]["replays"][m] > first["paras"]["replays"][m]
+                for m in ("ep", "tp")
+            ), "Missing both-mode replay"
+            assert (
+                last["paras"]["graph_pools"]["ep"] != last["paras"]["graph_pools"]["tp"]
+            )
+        assert len({r["id"] for r in requests}) == len(requests)
+        # Actual CUDA runtime traces supplement the mode-specific replay counters.
+        for target in ("ep", "tp"):
+            await switch(target)
+            await post("/start_profile", {"profile_prefix": target})
+            await generate(0, "The capital of Italy is", 32, label=f"profile-{target}")
+            await post("/stop_profile")
+        await switch("ep")
+        samples = idle_samples
+        summary = {}
+        for target in ("ep", "tp"):
+            values = [
+                r["last_timings"]
+                for r in samples
+                if r["mode"] == target and not r["noop"]
+            ]
+            summary[target] = {
+                key: {
+                    "median": statistics.median(v[key] for v in values),
+                    "p95": sorted(v[key] for v in values)[
+                        math.ceil(0.95 * len(values)) - 1
+                    ],
+                }
+                for key in values[0]
+            }
+        result = {
+            "passed": True,
+            "transport": initial["transport"],
+            "completed_requests": len(requests),
+            "cancelled_requests": 1,
+            "active_requests_at_switch": active_counts,
+            "prefill_before_first_token": prefill_before_first_token,
+            "transitions": transitions,
+            "requests": requests,
+            "timings_ms": summary,
+        }
+        (out / "live.json").write_text(json.dumps(result, indent=2))
+        print(
+            json.dumps(
+                {
+                    k: v
+                    for k, v in result.items()
+                    if k not in ("transitions", "requests")
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default="http://127.0.0.1:8765")
+    parser.add_argument("--output", required=True)
+    asyncio.run(main(parser.parse_args()))

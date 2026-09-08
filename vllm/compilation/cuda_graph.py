@@ -187,6 +187,7 @@ class CUDAGraphWrapper:
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
 
+        self.paras_replays = {"ep": 0, "tp": 0}
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
@@ -358,4 +359,9 @@ class CUDAGraphWrapper:
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
+        if self.vllm_config.paras_config is not None:
+            from vllm.model_executor.layers.fused_moe.paras.runtime import get_runtime
+
+            self.paras_replays[get_runtime().mode] += 1
+
         return entry.output
