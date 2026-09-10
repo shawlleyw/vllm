@@ -101,3 +101,62 @@ async def test_disconnected_control_request_completes_and_serializes():
     calls = list(client.calls)
     result = await client.paras_switch("ep")
     assert result["noop"] and result["epoch"] == 2 and client.calls == calls
+
+
+@pytest.mark.parametrize("pending_pause", [False, True])
+def test_dp_retires_async_batch_before_idle_or_pause(monkeypatch, pending_pause):
+    """Queued outputs keep DP alive without requiring requests to finish."""
+    from collections import deque
+    from concurrent.futures import Future
+    from contextlib import nullcontext
+
+    from vllm.config import ParallelConfig
+    from vllm.v1.engine.core import DPEngineCoreProc
+
+    engine = DPEngineCoreProc.__new__(DPEngineCoreProc)
+    engine.vllm_config = SimpleNamespace(paras_config=True)
+    engine.step_counter = 0
+    engine.pending_pause = pending_pause
+    engine.ignore_start_dp_wave = False
+    engine.dp_group = object()
+    votes = []
+
+    def consensus(group, *, has_unfinished, pending_pause):
+        # Other ranks are already idle/ready; this rank must not stop early.
+        votes.append((has_unfinished, pending_pause))
+        return has_unfinished, pending_pause
+
+    monkeypatch.setattr(ParallelConfig, "sync_dp_state", consensus)
+    running, queued = object(), object()
+    outputs = object()
+    future: Future[object] = Future()
+    engine.batch_queue_size = 2
+    engine.batch_queue = deque([(future, object(), future)])
+    engine.scheduler = SimpleNamespace(
+        running=[running], waiting=[queued], has_requests=lambda: False
+    )
+    engine.log_error_detail = lambda _: nullcontext()
+    engine.capture_iteration_details = lambda _: nullcontext(None)
+    engine._process_aborts_queue = lambda: None
+    engine._attach_iteration_details = lambda *_: None
+    received = []
+
+    def update(scheduled, result):
+        received.append(result)
+        return {}
+
+    engine.scheduler.update_from_output = update
+    assert engine._has_global_unfinished_reqs(False)
+    assert votes[-1] == (True, False)
+    assert not engine.ignore_start_dp_wave
+    assert not future.done()
+
+    future.set_result(outputs)
+    assert engine.step_with_batch_queue() == ({}, False)
+    assert received == [outputs]
+    assert not engine.batch_queue
+    assert not engine._has_global_unfinished_reqs(False)
+    assert votes[-1] == (False, pending_pause)
+    assert engine.ignore_start_dp_wave == pending_pause
+    assert engine.scheduler.running == [running]
+    assert engine.scheduler.waiting == [queued]

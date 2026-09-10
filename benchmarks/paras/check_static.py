@@ -31,13 +31,23 @@ async def main(args):
         timeout=aiohttp.ClientTimeout(total=600)
     ) as client:
 
-        async def post(path, body=None, headers=None):
+        async def raw_post(path, body=None, headers=None):
             async with client.post(
                 args.url + path, json=body, headers=headers
             ) as response:
                 response.raise_for_status()
                 raw = await response.text()
                 return json.loads(raw) if raw else None
+
+        async def post(path, body=None, headers=None):
+            # Worker collectives/profiling must not interleave with async forwards.
+            if path not in ("/collective_rpc", "/start_profile", "/stop_profile"):
+                return await raw_post(path, body, headers)
+            await raw_post("/pause?mode=keep&clear_cache=false", {})
+            try:
+                return await raw_post(path, body, headers)
+            finally:
+                await raw_post("/resume", {})
 
         async def snapshot():
             result = await post(

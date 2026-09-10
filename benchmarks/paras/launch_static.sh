@@ -45,7 +45,7 @@ args=("${PARAS_MODEL:-/data/shaoyuw/models/Qwen3-30B-A3B}"
   --data-parallel-backend mp --distributed-executor-backend mp
   --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 512
   --gpu-memory-utilization "${PARAS_MEMORY_UTILIZATION:-0.85}" --enable-chunked-prefill --enable-prefix-caching
-  --no-async-scheduling --no-enable-dbo --no-enable-eplb --no-enable-elastic-ep
+  --no-enable-dbo --no-enable-eplb --no-enable-elastic-ep
   --attention-config "$paras_attention_config"
   --compilation-config "$paras_compilation_config"
   --worker-extension-cls "${PARAS_WORKER_EXTENSION:-static_probe.StaticProbe}"
@@ -54,6 +54,16 @@ args=("${PARAS_MODEL:-/data/shaoyuw/models/Qwen3-30B-A3B}"
   --profiler-config.torch_profiler_with_stack false
   --profiler-config.ignore_frontend true
   --cudagraph-metrics --seed 0)
+case "${PARAS_ASYNC_SCHEDULING:-1}" in
+  1) args+=(--async-scheduling) ;;
+  0) args+=(--no-async-scheduling) ;;
+  *) echo "PARAS_ASYNC_SCHEDULING must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ "${PARAS_SCHEDULER_TRACE:-0}" == 1 ]]; then
+  [[ "${PARAS_ASYNC_SCHEDULING:-1}" == 1 ]]
+  export PARAS_SCHEDULER_TRACE_DIR="$out/scheduler"
+  args+=(--scheduler-cls async_probe.AsyncProbeScheduler)
+fi
 if [[ -n "${PARAS_MAMBA_CACHE_MODE:-}" ]]; then
   args+=(--mamba-cache-mode "$PARAS_MAMBA_CACHE_MODE")
 fi

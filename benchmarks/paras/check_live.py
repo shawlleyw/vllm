@@ -22,7 +22,7 @@ async def main(args):
         timeout=aiohttp.ClientTimeout(total=600)
     ) as client:
 
-        async def post(path, body=None, rank=None):
+        async def raw_post(path, body=None, rank=None):
             async with client.post(
                 args.url + path,
                 json=body,
@@ -32,6 +32,16 @@ async def main(args):
                 if r.status != 200:
                     raise RuntimeError(f"{path}: HTTP {r.status}: {text}")
                 return json.loads(text) if text else None
+
+        async def post(path, body=None, rank=None):
+            # Worker collectives/profiling must not interleave with async forwards.
+            if path not in ("/collective_rpc", "/start_profile", "/stop_profile"):
+                return await raw_post(path, body, rank)
+            await raw_post("/pause?mode=keep&clear_cache=false", {})
+            try:
+                return await raw_post(path, body, rank)
+            finally:
+                await raw_post("/resume", {})
 
         async def status():
             async with client.get(args.url + "/paras/status") as r:
@@ -270,8 +280,38 @@ async def main(args):
                 }
                 for key in values[0]
             }
+        async_evidence = []
+        if (out / "scheduler").is_dir():
+            for rank in range(args.world_size):
+                record = json.loads(
+                    (out / "scheduler" / f"rank-{rank}.json").read_text()
+                )
+                assert record["async_scheduling"]
+                assert record["steps_with_pending_outputs"] > 0
+                assert len(record["pauses"]) == len(record["resumes"])
+                retained = 0
+                for paused, resumed in zip(record["pauses"], record["resumes"]):
+                    assert resumed["pending_outputs"] == 0
+                    assert paused["scheduled_steps"] == resumed["scheduled_steps"]
+                    retained += len(set(paused["running"]) & set(resumed["running"]))
+                assert retained > 0
+                async_evidence.append(
+                    {
+                        "rank": rank,
+                        "steps_with_pending_outputs": record[
+                            "steps_with_pending_outputs"
+                        ],
+                        "retained_running_requests": retained,
+                        "pauses_with_pending_outputs": sum(
+                            p["pending_outputs"] > 0 for p in record["pauses"]
+                        ),
+                    }
+                )
+            assert any(r["pauses_with_pending_outputs"] for r in async_evidence)
         result = {
             "passed": True,
+            "async_scheduling": before[0]["async_scheduling"],
+            "async_evidence": async_evidence,
             "transport": initial["transport"],
             "world_size": args.world_size,
             "completed_requests": len(requests),

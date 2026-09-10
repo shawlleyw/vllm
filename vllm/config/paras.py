@@ -28,7 +28,6 @@ class ParasConfig:
 
         p = vllm_config.parallel_config
         m = vllm_config.model_config
-        s = vllm_config.scheduler_config
         requirements = {
             "one API process and internal DP load balancing": (
                 p._api_process_count == 1
@@ -53,7 +52,6 @@ class ParasConfig:
                 m is not None and m.dtype == torch.bfloat16 and m.quantization is None
             ),
             "V1 model runner": not envs.VLLM_USE_V2_MODEL_RUNNER,
-            "synchronous scheduling": not s.async_scheduling,
             "no DBO/EPLB/elastic EP": not (
                 p.enable_dbo or p.enable_eplb or p.enable_elastic_ep
             ),

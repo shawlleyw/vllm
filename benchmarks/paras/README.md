@@ -440,3 +440,24 @@ precision casts. Use the same settings for static and switching servers.
 Global PyTorch deterministic algorithms are not enabled: on this version they
 make indexed writes into Qwen's strided recurrent cache allocate a copy of the
 entire state view. Full decode graphs remain enabled with the reference settings.
+
+## Async scheduling and switch synchronization
+
+Launchers enable async scheduling by default. Set `PARAS_ASYNC_SCHEDULING=0`
+for a synchronous baseline. DBO remains disabled. V1 async scheduling permits
+two concurrent batches, overlapping CPU scheduling with model execution.
+
+Switching pauses new scheduling with `mode="keep", clear_cache=False`.
+Already-dispatched batches retire their outputs; running and waiting requests
+stay in the scheduler. DP pause consensus requires an empty async batch queue
+on every rank. Ranks continue participating in expert collectives until that
+common boundary, including dummy execution on idle ranks. Worker readiness,
+per-layer transfer fences, and the commit/resume barriers then serialize the
+weight transition before scheduling restarts. No request-completion drain is
+required.
+
+Set `PARAS_SCHEDULER_TRACE=1` when running the model matrix to record optional
+scheduler diagnostics. Live checks verify scheduling with prior outputs still
+pending, no new scheduled tokens between pause and resume, settled output
+placeholders at resume, and retained running requests. These traces measure
+pending-output overlap; use a profiler for CPU/GPU timing or speedup claims.

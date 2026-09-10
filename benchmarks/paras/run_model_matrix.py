@@ -26,7 +26,13 @@ BENCH = ROOT / "benchmarks/paras"
 MODELS = ("GLM-4.7-Flash", "GLM-4.5-Air", "Qwen3.6-35B-A3B")
 
 
-def request(url, path, body=None):
+def request(url, path, body=None, *, quiesce=True):
+    if quiesce and path in ("/collective_rpc", "/start_profile", "/stop_profile"):
+        request(url, "/pause?mode=keep&clear_cache=false", {})
+        try:
+            return request(url, path, body, quiesce=False)
+        finally:
+            request(url, "/resume", {})
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
         url + path, data=data, headers={"Content-Type": "application/json"}
@@ -76,6 +82,8 @@ def main(args):
             "TRITON_CACHE_MANAGER",
             "PARAS_FROZEN_AUTOTUNE",
             "PARAS_REFERENCE_NUMERICS",
+            "PARAS_ASYNC_SCHEDULING",
+            "PARAS_SCHEDULER_TRACE",
         )
     }
     url = f"http://127.0.0.1:{args.port}"
@@ -168,6 +176,12 @@ def main(args):
                     )
                     launch = json.loads((stage / "launch.json").read_text())
                     assert launch["gpus"] == gpus and launch["model"] == str(path)
+                    snapshots = json.loads((stage / "before.json").read_text())
+                    assert all(
+                        r.get("async_scheduling")
+                        == (env.get("PARAS_ASYNC_SCHEDULING", "1") == "1")
+                        for r in snapshots
+                    )
                     assert all(
                         json.loads((p / "generation.json").read_text()).get("execution")
                         == "one_prefill_then_decode"

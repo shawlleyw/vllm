@@ -57,6 +57,8 @@ class StaticProbe:
             "stationary_tensors": StationaryState(runner.model).signatures,
             "stationary_transfer_checks": getattr(self, "_paras_state_checks", []),
             "runner": type(runner).__module__,
+            "async_scheduling": runner.use_async_scheduling,
+            "max_concurrent_batches": self.vllm_config.max_concurrent_batches,
             "attention_tp_ranks": get_tp_group().ranks,
             "attention_dp_ranks": get_dp_group().ranks,
             "dp_rank": self.parallel_config.data_parallel_rank,
