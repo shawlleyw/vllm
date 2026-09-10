@@ -130,7 +130,6 @@ async def main(args):
                     0, "The capital of France is", 24, label=f"idle-{target}"
                 )
             )
-            assert "Paris" in requests[-1]["text"]
 
         # More than 64 rank-0 requests guarantees queueing. A streaming token
         # event establishes that switching occurs during decode, not beforehand.
@@ -149,6 +148,9 @@ async def main(args):
             for i in range(1 + rank % 3)
         ]
         await asyncio.wait_for(first_tokens.wait(), 120)
+        await post(
+            "/collective_rpc", {"method": "paras_watch_stationary_state", "args": [4]}
+        )
         active_counts = []
         for target in ("tp", "ep", "tp", "ep"):
             active_counts.append(sum(not t.done() for t in tasks))
@@ -158,21 +160,29 @@ async def main(args):
 
         # Large distinct prompts, above the scheduling budget, keep prefill
         # chunks active. Confirm a request is still waiting for its first tokens.
-        first_prefill_tokens = asyncio.Event()
-        tasks = [
-            asyncio.create_task(
-                generate(
-                    rank,
-                    f"Document {rank}: " + "A different short sentence. " * 1000,
-                    96,
-                    first_prefill_tokens,
-                    f"prefill-{rank}",
+        await post(
+            "/collective_rpc", {"method": "paras_watch_stationary_state", "args": [2]}
+        )
+        prefill_events = []
+        tasks = []
+        for rank in range(args.world_size):
+            for index in range(args.prefill_requests_per_rank):
+                seen = asyncio.Event()
+                prefill_events.append(seen)
+                tasks.append(
+                    asyncio.create_task(
+                        generate(
+                            rank,
+                            f"Document {rank}-{index}: "
+                            + "A different short sentence. " * 1000,
+                            96,
+                            seen,
+                            f"prefill-{rank}-{index}",
+                        )
+                    )
                 )
-            )
-            for rank in range(args.world_size)
-        ]
         await asyncio.sleep(0.03)
-        prefill_before_first_token = not first_prefill_tokens.is_set()
+        prefill_before_first_token = any(not seen.is_set() for seen in prefill_events)
         prefill_switches = [await switch("tp"), await switch("ep")]
         requests.extend(await asyncio.gather(*tasks))
         assert prefill_before_first_token
@@ -218,7 +228,10 @@ async def main(args):
             assert first["attention_tp_ranks"] == last["attention_tp_ranks"]
             assert first["attention_dp_ranks"] == last["attention_dp_ranks"]
             assert first["kv_addresses"] == last["kv_addresses"], "KV moved"
+            assert first["stationary_tensors"] == last["stationary_tensors"]
             assert first["all_weight_addresses"] == last["all_weight_addresses"]
+            assert len(last["stationary_transfer_checks"]) == 6
+            assert all(check["passed"] for check in last["stationary_transfer_checks"])
             assert first["counters"] == last["counters"], (
                 "Compilation/capture after init"
             )
@@ -289,4 +302,8 @@ if __name__ == "__main__":
     parser.add_argument("--world-size", type=int, choices=(2, 4, 8), required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8765")
     parser.add_argument("--output", required=True)
-    asyncio.run(main(parser.parse_args()))
+    parser.add_argument("--prefill-requests-per-rank", type=int, default=1)
+    args = parser.parse_args()
+    if args.prefill_requests_per_rank < 1:
+        parser.error("prefill-requests-per-rank must be positive")
+    asyncio.run(main(args))

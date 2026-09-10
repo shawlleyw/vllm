@@ -23,7 +23,7 @@ def disjoint_plan(self, layout, transport):
             "The disjoint oracle uses peer_access for initial materialization"
         )
     _plan(self, layout, transport)
-    for layer in range(layout.layers):
+    for layer in layout.layer_indices:
         for name in ("w13", "w2"):
             key = f"tp.{layer}.{name}"
             self.entries[key] = replace(

@@ -24,8 +24,20 @@ class ExpertLayout:
     intermediate: int
     ep_size: int
     expert_tp_size: int
+    # Original transformer layer IDs with routed experts; dense layers are omitted.
+    layer_indices: tuple[int, ...] | None = None
 
     def __post_init__(self):
+        if self.layer_indices is None:
+            object.__setattr__(self, "layer_indices", tuple(range(self.layers)))
+        indices = self.layer_indices
+        assert indices is not None
+        if (
+            len(indices) != self.layers
+            or tuple(sorted(set(indices))) != indices
+            or any(i < 0 for i in indices)
+        ):
+            raise ValueError("Expert layer indices must be unique and increasing")
         if min(self.layers, self.experts, self.hidden, self.intermediate) <= 0:
             raise ValueError("Expert dimensions must be positive")
         if self.ep_size not in (2, 4, 8) or self.expert_tp_size != self.ep_size:
@@ -39,15 +51,41 @@ class ExpertLayout:
 
     @classmethod
     def from_model(cls, hf_config, *, ep_size: int, expert_tp_size: int):
-        if hf_config.model_type != "qwen3_moe":
-            raise ValueError("No PARAS expert layout registered for this model")
+        # Multimodal wrappers describe the routed experts in their text config.
+        config = getattr(hf_config, "text_config", None) or hf_config
+        model_type = config.model_type
+        indices = tuple(range(config.num_hidden_layers))
+        if model_type in ("qwen2_moe", "qwen3_moe", "qwen3_next"):
+            dense = set(getattr(config, "mlp_only_layers", []))
+            step = getattr(config, "decoder_sparse_step", 1)
+            if step < 1:
+                raise ValueError("decoder_sparse_step must be positive")
+            indices = tuple(
+                i for i in indices if i not in dense and (i + 1) % step == 0
+            )
+            experts = config.num_experts
+        elif model_type == "qwen3_5_moe_text":
+            # Attention types alternate, but every decoder layer has routed experts.
+            experts = config.num_experts
+        elif model_type in ("glm4_moe", "glm4_moe_lite", "deepseek_v2", "deepseek_v3"):
+            first = config.first_k_dense_replace
+            step = (
+                1 if model_type == "glm4_moe" else getattr(config, "moe_layer_freq", 1)
+            )
+            if first < 0 or first >= config.num_hidden_layers or step < 1:
+                raise ValueError("Invalid dense prefix or MoE layer frequency")
+            indices = tuple(i for i in indices if i >= first and i % step == 0)
+            experts = config.n_routed_experts
+        else:
+            raise ValueError(f"No PARAS expert layout registered for {model_type}")
         return cls(
-            hf_config.num_hidden_layers,
-            hf_config.num_experts,
-            hf_config.hidden_size,
-            hf_config.moe_intermediate_size,
+            len(indices),
+            experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
             ep_size=ep_size,
             expert_tp_size=expert_tp_size,
+            layer_indices=indices,
         )
 
     def shapes(self, mode: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -85,14 +123,15 @@ class ExpertArena:
         w13, w2 = layout.shapes("ep")
         self.w2_offset = align(prod(w13) * 2)
         self.slab_bytes = self.w2_offset + align(prod(w2) * 2)
+        assert layout.layer_indices is not None
         for mode in ("ep", "tp"):
-            for layer in range(layout.layers):
-                base = (layer + (mode == "tp")) * self.slab_bytes
+            for slot, layer_id in enumerate(layout.layer_indices):
+                base = (slot + (mode == "tp")) * self.slab_bytes
                 for name, shape, offset in zip(
                     ("w13", "w2"), layout.shapes(mode), (base, base + self.w2_offset)
                 ):
                     self.reserve(
-                        f"{mode}.{layer}.{name}", shape, torch.bfloat16, offset
+                        f"{mode}.{layer_id}.{name}", shape, torch.bfloat16, offset
                     )
         if transport == "nccl":
             self.reserve("scratch.w13", w13, torch.bfloat16)
@@ -133,8 +172,9 @@ class ExpertArena:
         return tensor.is_contiguous() and 0 <= start <= self.nbytes - tensor.nbytes
 
     def transfer_order(self, target: str):
+        assert self.layout.layer_indices is not None
         if target == "tp":
-            return range(self.layout.layers - 1, -1, -1)
+            return reversed(self.layout.layer_indices)
         if target == "ep":
-            return range(self.layout.layers)
+            return iter(self.layout.layer_indices)
         raise ValueError(target)

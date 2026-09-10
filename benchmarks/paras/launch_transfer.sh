@@ -17,6 +17,10 @@ export PATH="$PWD/.venv/bin:$PATH"
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/nccl/lib"
 unset PYTHONPATH NVSHMEM_DIR
 .venv/bin/python benchmarks/paras/check_gpus.py
+layout_args=(--layers 48)
+if [[ -n "${PARAS_MODEL:-}" ]]; then
+  layout_args=(--model "$PARAS_MODEL")
+fi
 exec .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node="$paras_size" \
-  benchmarks/paras/check_transfer.py --method "$method" --layers 48 --rounds 12 \
+  benchmarks/paras/check_transfer.py --method "$method" "${layout_args[@]}" --rounds 12 \
   --output "$output"

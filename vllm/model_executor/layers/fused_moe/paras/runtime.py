@@ -42,7 +42,7 @@ class ManagedMoEMethod(UnquantizedFusedMoEMethod):
         match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer_name)
         if match is None:
             raise ValueError(f"Unknown expert layer name: {layer_name}")
-        self.layer_index = int(match.group(1))
+        self.layer_id = int(match.group(1))
 
     def create_weights(
         self,
@@ -61,7 +61,7 @@ class ManagedMoEMethod(UnquantizedFusedMoEMethod):
             (num_experts, hidden_size, intermediate_size_per_partition),
         )
         for name, shape in zip(("w13", "w2"), shapes):
-            tensor = arena.view(f"{self.mode}.{self.layer_index}.{name}")
+            tensor = arena.view(f"{self.mode}.{self.layer_id}.{name}")
             if tuple(tensor.shape) != shape:
                 raise ValueError(f"Managed {name} shape differs from backend: {shape}")
             param = torch.nn.Parameter(tensor, requires_grad=False)
@@ -92,6 +92,7 @@ class MoEStates:
     runner: torch.nn.Module
     ep: RoutedExperts
     tp: RoutedExperts
+    layer_id: int
 
     def activate(self, mode):
         experts = getattr(self, mode)
@@ -106,7 +107,7 @@ class ParasRuntime:
         self.config = config
         config.paras_config.validate(config)
         layout = ExpertLayout.from_model(
-            config.model_config.hf_config,
+            config.model_config.hf_text_config,
             ep_size=config.parallel_config.data_parallel_size,
             expert_tp_size=config.paras_config.expert_tp_size,
         )
@@ -120,6 +121,7 @@ class ParasRuntime:
         self.failed = False
         self.initialized = False
         self.states = []
+        self.stationary_state = None
         self.graph_states: weakref.WeakKeyDictionary[Any, dict[str, dict]] = (
             weakref.WeakKeyDictionary()
         )
@@ -214,8 +216,12 @@ class ParasRuntime:
                 **kwargs,
             )
             tp.quant_method.process_weights_after_loading(tp)
-            self.states.append(MoEStates(runner, ep, tp))
-        if len(self.states) != self.arena.layout.layers:
+            assert isinstance(ep.quant_method, ManagedMoEMethod)
+            self.states.append(MoEStates(runner, ep, tp, ep.quant_method.layer_id))
+        if (
+            tuple(sorted(s.layer_id for s in self.states))
+            != self.arena.layout.layer_indices
+        ):
             raise ValueError("Model layers differ from reserved expert layout")
         self.transfer = WeightTransfer(
             self.arena,
@@ -226,16 +232,19 @@ class ParasRuntime:
         self.assert_addresses()
 
     def assert_addresses(self):
-        for index, state in enumerate(self.states):
+        for state in self.states:
             for mode in ("ep", "tp"):
                 experts = getattr(state, mode)
                 for name in ("w13", "w2"):
                     tensor = getattr(experts, name + "_weight")
                     if (
                         tensor.data_ptr()
-                        != self.arena.view(f"{mode}.{index}.{name}").data_ptr()
+                        != self.arena.view(f"{mode}.{state.layer_id}.{name}").data_ptr()
                     ):
                         raise RuntimeError("Managed weight address changed")
+
+        if self.stationary_state is not None:
+            self.stationary_state.check()
 
     def select_graphs(self, target):
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
@@ -333,6 +342,13 @@ class ParasRuntime:
             "rank": get_dp_group().rank_in_group,
             "expert_ranks": self.expert_ranks,
             "arena_bytes": self.arena.nbytes,
+            "expert_layer_indices": self.arena.layout.layer_indices,
+            "shared_expert_layers": sum(
+                s.runner.shared_experts is not None for s in self.states
+            ),
+            "stationary_tensors": len(self.stationary_state.signatures)
+            if self.stationary_state
+            else 0,
             "arena_address": self.arena.buffer.data_ptr(),
             "last_timings": self.last_timings,
             "requests_at_pause": self.last_requests,

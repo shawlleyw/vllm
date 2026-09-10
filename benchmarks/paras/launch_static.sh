@@ -34,21 +34,32 @@ export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 nvidia-smi --query-gpu=index,uuid,name,memory.used,utilization.gpu --format=csv > "$out/gpus-before.csv"
 .venv/bin/python benchmarks/paras/check_gpus.py
-args=(/data/shaoyuw/models/Qwen3-30B-A3B
-  --host 127.0.0.1 --port 8765 --served-model-name paras-qwen --api-server-count 1
+paras_attention_config=${PARAS_ATTENTION_CONFIG:-'{"flash_attn_version":2}'}
+paras_compilation_config='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32,64]}'
+if [[ "${PARAS_REFERENCE_NUMERICS:-0}" == 1 ]]; then
+  paras_compilation_config='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32,64],"inductor_compile_config":{"deterministic":true,"benchmark_fusion":false,"combo_kernels":false,"benchmark_combo_kernel":false,"emulate_precision_casts":true}}'
+fi
+args=("${PARAS_MODEL:-/data/shaoyuw/models/Qwen3-30B-A3B}"
+  --host 127.0.0.1 --port "${PARAS_PORT:-8765}" --served-model-name paras-qwen --api-server-count 1
   --dtype bfloat16 --tensor-parallel-size 1 --data-parallel-size "$paras_size"
   --data-parallel-backend mp --distributed-executor-backend mp
   --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 512
-  --gpu-memory-utilization 0.85 --enable-chunked-prefill --enable-prefix-caching
+  --gpu-memory-utilization "${PARAS_MEMORY_UTILIZATION:-0.85}" --enable-chunked-prefill --enable-prefix-caching
   --no-async-scheduling --no-enable-dbo --no-enable-eplb --no-enable-elastic-ep
-  --attention-config '{"backend":"FLASH_ATTN","flash_attn_version":2}'
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32,64]}'
+  --attention-config "$paras_attention_config"
+  --compilation-config "$paras_compilation_config"
   --worker-extension-cls "${PARAS_WORKER_EXTENSION:-static_probe.StaticProbe}"
   --profiler-config.profiler torch
   --profiler-config.torch_profiler_dir "$out/profiles"
   --profiler-config.torch_profiler_with_stack false
   --profiler-config.ignore_frontend true
   --cudagraph-metrics --seed 0)
+if [[ -n "${PARAS_MAMBA_CACHE_MODE:-}" ]]; then
+  args+=(--mamba-cache-mode "$PARAS_MAMBA_CACHE_MODE")
+fi
+if [[ "${PARAS_LANGUAGE_MODEL_ONLY:-0}" == 1 ]]; then
+  args+=(--language-model-only)
+fi
 if [[ -n "${PARAS_TRANSPORT:-}" ]]; then
   [[ "$mode" == ep ]]
   args+=(--paras-config "{\"expert_tp_size\":$paras_size,\"weight_transfer_method\":\"$PARAS_TRANSPORT\"}")

@@ -25,58 +25,26 @@ async def main(args):
                 raw = await r.text()
                 return json.loads(raw) if raw else None
 
-        if not args.already_started:
-            await post("/collective_rpc", {"method": "paras_logits_start"})
+        history = None
         if args.history:
             history = json.loads(Path(args.history).read_text())["tokens"]
             assert len(history) == 32
-            prompt_ids = (
-                await post(
-                    "/tokenize",
-                    {
-                        "model": "paras-qwen",
-                        "prompt": "The capital of France is",
-                        "add_special_tokens": False,
-                    },
-                )
-            )["tokens"]
-            # Isolate numerical measurements from earlier diagnostic requests.
-            await post("/reset_prefix_cache", {})
-            parts, tokens = [], []
-            for step in range(32):
-                result = await post(
-                    "/v1/completions",
-                    {
-                        "model": "paras-qwen",
-                        "prompt": prompt_ids
-                        + [int(t.removeprefix("token_id:")) for t in history[:step]],
-                        "max_tokens": 1,
-                        "temperature": 0,
-                        "ignore_eos": True,
-                        "logprobs": 5,
-                        "return_tokens_as_token_ids": True,
-                    },
-                )
-                choice = result["choices"][0]
-                parts.append(choice["text"])
-                tokens.extend(choice["logprobs"]["tokens"])
+        if not args.already_started:
+            # Match the attention execution path as well as the token history:
+            # one prefill followed by 31 decode steps in every configuration.
+            reset = await post("/reset_prefix_cache", {})
+            assert reset["success"], "Prefix cache still held by active requests"
+            forced = (
+                [int(t.removeprefix("token_id:")) for t in history]
+                if history is not None
+                else None
+            )
             await post(
-                "/collective_rpc", {"method": "paras_logits_stop", "args": [str(out)]}
+                "/collective_rpc",
+                {"method": "paras_logits_start", "args": [forced]},
             )
-            (out / "generation.json").write_text(
-                json.dumps(
-                    {
-                        "text": "".join(parts),
-                        "tokens": tokens,
-                        "history_tokens": history,
-                        "forced_history": True,
-                        "transition": None,
-                    },
-                    indent=2,
-                )
-            )
-            print(f"Captured 32 forced-history steps into {out}", flush=True)
-            return
+        elif history is not None:
+            raise ValueError("Forced history must be installed by this probe")
         count = 0
         switched = False
         transition = None
@@ -112,12 +80,16 @@ async def main(args):
         await post(
             "/collective_rpc", {"method": "paras_logits_stop", "args": [str(out)]}
         )
-        (out / "generation.json").write_text(
-            json.dumps(
-                {"text": "".join(parts), "tokens": tokens, "transition": transition},
-                indent=2,
-            )
-        )
+        generation = {
+            "text": "".join(parts),
+            "tokens": tokens,
+            "transition": transition,
+            "execution": "one_prefill_then_decode",
+        }
+        if history is not None:
+            assert tokens == history, "Forced sampling did not preserve token history"
+            generation.update(history_tokens=history, forced_history=True)
+        (out / "generation.json").write_text(json.dumps(generation, indent=2))
         assert count == 32
         print(f"Captured {count} steps into {out}", flush=True)
 

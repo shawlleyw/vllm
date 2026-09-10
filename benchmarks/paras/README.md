@@ -157,7 +157,7 @@ managed views. Timing reports logical per-rank weight bytes divided by transfer
 time; this is not a measurement of physical NVLink traffic.
 
 `capture_logits.py` uses the opt-in diagnostic worker extension to save complete
-151936-vocabulary logits outside graphs. Compare static and PARAS modes with
+full-vocabulary logits outside graphs. Compare static and PARAS modes with
 matching token histories; `--switch` changes to TP during the same generation.
 `check_static.py --skip-profile` provides the same steady-mode workload without
 adding profiler traces to a live-suite run. These short workload measurements
@@ -266,10 +266,12 @@ PARAS_GPUS=0,1,2,3,4,5,6,7 benchmarks/paras/launch_paras.sh peer_access \
 
 When BF16 reductions produce different greedy continuations, use
 `capture_logits.py --history /path/to/reference/generation.json` for each steady
-mode. This generates one token for each explicitly forced prefix and records
-input histories separately from sampled outputs. Use the same history and
-protocol for both static and PARAS captures. The numerical diagnostic resets
-prefix caching before measurement; the switch operation itself never does so.
+mode. The worker records unmodified logits, then forces the sampled token to
+keep one live request on the reference history. Every capture uses one prefill
+followed by 31 decode steps, preserving the same attention path and KV evolution.
+Use the same history and protocol for both static and PARAS captures. The
+numerical diagnostic resets prefix caching before measurement; the switch
+operation itself never does so.
 Mixed-mode live captures still use `--switch` without `--history` and require a
 disjoint oracle with matching recorded histories.
 
@@ -306,3 +308,135 @@ PARAS_GPUS=4,5,6,7 benchmarks/paras/launch_paras.sh peer_access \
 This explicitly selects attention TP1/DP4, EP4 at startup, and expert TP4 after
 switching. It passes `--data-parallel-size 4` and
 `--paras-config '{"expert_tp_size":4,"weight_transfer_method":"peer_access"}'`.
+
+## Dense prefixes, shared experts, and hybrid attention
+
+PARAS now reserves slabs for routed MoE layers only. `ExpertLayout.layer_indices`
+records the original transformer layer IDs, omitting dense prefixes and gaps
+between MoE layers. Runtime states, reservations (for example, `ep.3.w13`), and
+transfer order use those IDs. Only the allocator uses compact slab positions. The shared factory retains each model's routing and
+separate shared-expert module. Attention TP remains 1, so dense MLPs and shared
+experts stay replicated and outside the arena. Fused shared-expert slots are
+rejected; quantization and context/pipeline parallelism remain unsupported.
+
+Layout metadata covers Qwen2/3 MoE, Qwen3-Next, Qwen3.5/3.6 MoE text configurations,
+GLM4 MoE/Lite, and DeepSeek V2/V3. A layout entry establishes weight geometry,
+not GPU acceptance for every checkpoint. Qwen3.6-35B-A3B uses the existing
+`Qwen3_5MoeForConditionalGeneration` implementation and its nested text config.
+
+`StationaryState` records non-routed parameter/buffer bindings after both graph
+sets are captured. It also records attention cache attributes, including tuples
+of convolution and recurrent state used by linear attention. Each switch checks
+storage addresses, shapes, strides, and dtypes. Values are allowed to evolve
+while generating; live model comparisons separately validate correctness.
+
+The launcher accepts `PARAS_MODEL`, `PARAS_ATTENTION_CONFIG`, `PARAS_PORT`, and
+`PARAS_LANGUAGE_MODEL_ONLY`. Attention defaults to automatic backend selection
+with FlashAttention version 2 for applicable backends. On A100, MLA can select
+Triton MLA instead of forcing the ordinary FlashAttention backend. Hybrid models
+use `mamba_cache_mode=align` with prefix caching. Model-specific kernels must still
+support full single-token decode graphs. DSA on A100 is not supported by the
+available sparse attention backends and is not enabled by these layout changes.
+
+After downloading the models and completing CPU checks, select four idle GPUs
+(excluding broken GPU 1 on the development host) and run:
+
+```bash
+.venv/bin/python benchmarks/paras/run_model_matrix.py \
+  --gpus 0,2,3,4 --world-size 4 \
+  --output /data/shaoyuw/paras/vllm-model-extension/runs
+```
+
+The GPU list is an example, not an availability claim. Launchers check immediately
+before use and fail if a GPU is occupied. The matrix tests GLM-4.7-Flash,
+GLM-4.5-Air, and Qwen3.6-35B-A3B sequentially. Use `--models MODEL` to run one.
+It covers full-layout exact synthetic transfers with both transports, static
+EP/TP serving, live queued/decode/prefill/cancellation switching, graph replay,
+fixed state bindings, and steady-mode full-vocabulary logits under matched token
+histories. Qwen runs with `--language-model-only`; image/video serving is outside
+this attention/MoE acceptance matrix. Results are written per model and stage.
+
+The fixed compilation counters track vLLM compilation and CUDA graph capture.
+First-use Triton JIT events on non-full-graph paths are reported separately in
+the server logs, including for static baselines. Graph preservation is verified
+for the configured full-decode capture sizes.
+
+```bash
+.venv/bin/python -m pytest --confcutdir=tests/model_executor/layers/fused_moe \
+  tests/model_executor/layers/fused_moe/test_paras_storage.py \
+  tests/model_executor/layers/fused_moe/test_paras_state.py \
+  tests/model_executor/layers/fused_moe/test_paras_transaction.py -q
+```
+
+The matrix reserves 95% of GPU memory for GLM-4.5-Air and 85% for the smaller
+models; `PARAS_MEMORY_UTILIZATION` overrides this choice. Model weights remain
+BF16, including the dense prefix and separate shared experts.
+
+For an isolated numerical comparison, `--logits-only` runs the four server
+configurations with matching histories, profiles real decode graph replay, and
+checks that capture counters and weight/cache bindings stay fixed. It omits the
+live-serving and synthetic-transfer suites and labels its completion record
+accordingly. `VLLM_BATCH_INVARIANT=1` is incompatible with the required
+batched Triton EP backend in this checkout and fails during initialization.
+The explicit `paras_tensor_digests` diagnostic RPC hashes all model parameters
+on every rank for untimed corruption checks; its CPU copies are not part of the
+switch implementation or timing measurements.
+
+To exercise model architectures with smaller memory and compile costs, create
+canonical synthetic checkpoints from their original tensor shapes:
+
+```bash
+.venv/bin/python benchmarks/paras/make_dummy_models.py \
+  --output /data/shaoyuw/paras/vllm-model-extension/dummy-models
+.venv/bin/python benchmarks/paras/run_model_matrix.py \
+  --gpus 4,5,6,7 --world-size 4 \
+  --model-root /data/shaoyuw/paras/vllm-model-extension/dummy-models \
+  --output /data/shaoyuw/paras/vllm-model-extension/runs-dummy
+```
+
+Defaults are five GLM layers (one dense plus four routed/shared MoE layers),
+and eight Qwen layers (six linear-attention plus two full-attention layers).
+Hidden dimensions, expert counts and intermediate sizes remain unchanged.
+Each checkpoint tensor is seeded by its logical name, and all EP/TP runs load
+that same checkpoint through the ordinary loader. Vision and prediction-head
+weights are omitted. Norms have unit effective scale: Qwen offset norms use
+zero weights, while its gated linear-attention norms use ones.
+These runs test architecture and switching correctness,
+not pretrained model quality or full-depth serving capacity.
+
+Synthetic runs use 85% memory reservation and eight distinct long prompts per
+rank so that switching overlaps chunked prefill even with fewer layers. The
+probe confirms partially computed prompts in the scheduler pause snapshots.
+`--resume` can reuse passed serving stages with matching model/GPU metadata;
+use it only when the changes being tested do not affect those prior results.
+
+For numerical comparisons of autotuned attention, reuse the same reference
+kernel choices across servers. Independently tuned linear-attention prefill
+kernels can produce different recurrent states even with matching weights and
+token histories. This is separate from preserving cache contents during a
+switch. Export the rank-0 tuning results from a completed static EP baseline:
+
+```bash
+.venv/bin/python benchmarks/paras/paras_tuning.py \
+  --source /path/to/static-ep/cache --output /path/to/reference-tuning
+TRITON_CACHE_MANAGER=paras_tuning:FrozenAutotuneCacheManager \
+PARAS_FROZEN_AUTOTUNE=/path/to/reference-tuning \
+.venv/bin/python benchmarks/paras/run_model_matrix.py \
+  --gpus 4,5,6,7 --world-size 4 --models Qwen3.6-35B-A3B \
+  --model-root /path/to/dummy-models --output /path/to/comparison-runs
+```
+
+The cache manager reuses only matching autotuning signatures, leaves compiled
+binary caching intact, and fails if a required signature is missing. Snapshots
+record the signatures used on every rank. Launch/completion metadata records
+the cache and numerical environment settings. This does not enable batch
+invariance or alter the comparison tolerances.
+
+`PARAS_REFERENCE_NUMERICS=1` with `CUBLAS_WORKSPACE_CONFIG=:4096:8` adds
+explicit BF16 numerical-reference settings to both launchers: cuBLASLt with
+full-precision accumulation and split-K disabled, deterministic Inductor
+selection, no benchmark-driven fusion/combo kernels, and preserved intermediate
+precision casts. Use the same settings for static and switching servers.
+Global PyTorch deterministic algorithms are not enabled: on this version they
+make indexed writes into Qwen's strided recurrent cache allocate a copy of the
+entire state view. Full decode graphs remain enabled with the reference settings.

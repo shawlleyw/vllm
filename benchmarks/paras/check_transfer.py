@@ -42,7 +42,8 @@ def pattern(shape, layer, weight, expert_start, intermediate_start, mode, device
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--method", choices=["nccl", "peer_access"], required=True)
-    p.add_argument("--layers", type=int, default=48)
+    p.add_argument("--layers", type=int)
+    p.add_argument("--model", help="Local model config; test all routed layers")
     p.add_argument("--rounds", type=int, default=12)
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
@@ -51,11 +52,19 @@ def main():
     dist.init_process_group("gloo")
     gpu_group = dist.new_group(backend="nccl")
     size = dist.get_world_size()
-    layout = ExpertLayout(args.layers, 128, 2048, 768, size, size)
+    if args.model:
+        from transformers import AutoConfig
+
+        if args.layers is not None:
+            p.error("--model tests every routed layer; do not combine with --layers")
+        config = AutoConfig.from_pretrained(args.model, local_files_only=True)
+        layout = ExpertLayout.from_model(config, ep_size=size, expert_tp_size=size)
+    else:
+        layout = ExpertLayout(args.layers or 48, 128, 2048, 768, size, size)
     arena = ExpertArena(layout, args.method)
     arena.materialize(f"cuda:{rank}")
     transfer = WeightTransfer(arena, args.method, dist.group.WORLD, gpu_group)
-    for layer in range(layout.layers):
+    for layer in layout.layer_indices:
         for weight in ("w13", "w2"):
             target = arena.view(f"ep.{layer}.{weight}")
             target.copy_(
@@ -77,7 +86,7 @@ def main():
             dist.barrier()
             times[mode].append(transfer.move(mode))
             if iteration in (0, args.rounds - 1):
-                for layer in range(layout.layers):
+                for layer in layout.layer_indices:
                     for weight in ("w13", "w2"):
                         target = arena.view(f"{mode}.{layer}.{weight}")
                         expected = pattern(
@@ -104,7 +113,9 @@ def main():
         "rank": rank,
         "world_size": size,
         "method": args.method,
-        "layers": args.layers,
+        "layers": layout.layers,
+        "expert_layer_indices": layout.layer_indices,
+        "model": args.model,
         "arena_bytes": arena.nbytes,
         "exact_roundtrip": "passed",
         "times_ms": times,

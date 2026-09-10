@@ -39,6 +39,8 @@ class ParasConfig:
                 p.tensor_parallel_size == 1
                 and p.data_parallel_size == self.expert_tp_size
                 and p.pipeline_parallel_size == 1
+                and p.prefill_context_parallel_size == 1
+                and p.decode_context_parallel_size == 1
                 and p.data_parallel_size_local == self.expert_tp_size
             ),
             "EP startup with DeepEP low latency": (
@@ -47,11 +49,8 @@ class ParasConfig:
             "batched Triton EP experts": (
                 vllm_config.kernel_config.moe_backend == "batched_triton"
             ),
-            "BF16 Qwen3 MoE": (
-                m is not None
-                and m.dtype == torch.bfloat16
-                and m.hf_config.model_type == "qwen3_moe"
-                and m.quantization is None
+            "unquantized BF16 routed experts": (
+                m is not None and m.dtype == torch.bfloat16 and m.quantization is None
             ),
             "V1 model runner": not envs.VLLM_USE_V2_MODEL_RUNNER,
             "synchronous scheduling": not s.async_scheduling,
@@ -71,3 +70,11 @@ class ParasConfig:
         failures = [name for name, valid in requirements.items() if not valid]
         if failures:
             raise ValueError("PARAS requires " + ", ".join(failures))
+
+        from vllm.model_executor.layers.fused_moe.paras.storage import ExpertLayout
+
+        ExpertLayout.from_model(
+            m.hf_text_config,
+            ep_size=p.data_parallel_size,
+            expert_tp_size=self.expert_tp_size,
+        )

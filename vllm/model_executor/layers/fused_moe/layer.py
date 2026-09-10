@@ -373,6 +373,10 @@ def FusedMoEFactory(
             ParasRoutedExperts,
         )
 
+        if num_fused_shared_experts:
+            raise ValueError(
+                "PARAS requires shared experts separate from routed storage"
+            )
         if routed_experts_cls is not None or quant_config is not None:
             raise ValueError("PARAS requires standard unquantized routed experts")
         routed_experts_cls = ParasRoutedExperts

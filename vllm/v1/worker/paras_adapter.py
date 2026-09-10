@@ -36,5 +36,9 @@ def capture_both(runner):
     for mode, count in runtime.status()["graphs"].items():
         if count == 0:
             raise RuntimeError(f"PARAS did not capture {mode} decode graphs")
+    from vllm.model_executor.layers.fused_moe.paras.state import StationaryState
+
+    runtime.stationary_state = StationaryState(runner.model, runtime.arena)
+    runtime.assert_addresses()
     runtime.initialized = True
     return total

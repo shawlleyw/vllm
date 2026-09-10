@@ -45,7 +45,9 @@ def main(args):
     results = []
     for directory in args.candidates:
         value, tokens, modes = read(directory)
-        assert value.shape == (32, 151936) and len(modes) == len(tokens) == 32
+        assert (
+            value.shape == references["ep"][0].shape and len(modes) == len(tokens) == 32
+        )
         assert torch.isfinite(value).all()
         for index, mode in enumerate(modes):
             assert tokens[:index] == references[mode][1][:index], (
@@ -56,12 +58,16 @@ def main(args):
         result = {
             "candidate": str(directory),
             "steps": 32,
-            "vocabulary_size": 151936,
+            "vocabulary_size": value.shape[1],
             "modes": modes,
             "static_mode_comparison": stats,
         }
+        failures = []
         if len(set(modes)) == 1:
-            torch.testing.assert_close(value, reference, atol=0.25, rtol=0.01)
+            try:
+                torch.testing.assert_close(value, reference, atol=0.25, rtol=0.01)
+            except AssertionError as error:
+                failures.append(str(error))
             result["bitwise_equal_to_static"] = torch.equal(value, reference)
         else:
             # Retained KV contains activations computed under earlier expert
@@ -81,8 +87,10 @@ def main(args):
             assert tokens == oracle[1] and modes == oracle[2], "Oracle histories differ"
             torch.testing.assert_close(value, oracle[0], atol=0, rtol=0)
             result["bitwise_equal_to_disjoint_oracle"] = True
-        assert stats["greedy_token_agreement"] == 1
-        result["passed"] = True
+        if stats["greedy_token_agreement"] != 1:
+            failures.append("Greedy tokens differ from the matching static mode")
+        result["passed"] = not failures
+        result["failures"] = failures
         results.append(result)
     output = {
         "static_EP_TP_arithmetic_difference": cross,
@@ -92,6 +100,8 @@ def main(args):
     }
     Path(args.output).write_text(json.dumps(output, indent=2))
     print(json.dumps(output, indent=2))
+    failed = [r["candidate"] for r in results if not r["passed"]]
+    assert not failed, f"Numerical comparisons failed: {failed}"
 
 
 if __name__ == "__main__":
