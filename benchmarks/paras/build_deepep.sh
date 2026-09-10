@@ -4,7 +4,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 repo=${1:-/data/shaoyuw/paras/vllm-milestone/DeepEP-sm80}
 expected=8e57c764c7d3fdb0999fe3e34a03371c8f53ae1b
-[[ -d .venv/conda-meta ]]
+[[ -x .venv/bin/python ]]
+export PATH="$PWD/.tools:$PWD/.venv/bin:$PATH"
+export UV_CACHE_DIR="$PWD/.cache/uv"
 [[ $(git -C "$repo" rev-parse HEAD) == "$expected" ]]
 export CUDA_HOME=/usr/local/cuda-13.0
 export NVSHMEM_DIR="$PWD/.venv/lib/python3.12/site-packages/nvidia/nvshmem"
@@ -42,7 +44,7 @@ s = p.read_text().replace(
             }''')
 p.write_text(s)
 PY
-.venv/bin/uv pip install --python .venv/bin/python --no-build-isolation --reinstall-package deep-ep "$repo"
+uv pip install --python .venv/bin/python --no-build-isolation --reinstall-package deep-ep "$repo"
 .venv/bin/python - <<'PY'
 import deep_ep, deep_ep_cpp, torch
 print('torch', torch.__version__, 'DeepEP', deep_ep_cpp.__file__)

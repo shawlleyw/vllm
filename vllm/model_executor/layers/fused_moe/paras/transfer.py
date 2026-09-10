@@ -158,16 +158,15 @@ class WeightTransfer:
 
     def _nccl_layer(self, layer: int, target: str):
         a, layout = self.arena, self.arena.layout
-        e, t, h, i = (
-            layout.experts // layout.ep_size,
-            layout.expert_tp_size,
-            layout.hidden,
-            layout.intermediate // layout.expert_tp_size,
-        )
-        for name, tail in (("w13", (2, i * h)), ("w2", (h, i))):
-            ep = a.view(f"ep.{layer}.{name}")
-            tp = a.view(f"tp.{layer}.{name}")
-            staging = a.view(f"scratch.{name}")
+        e, t = layout.experts // layout.ep_size, layout.expert_tp_size
+        for name, (shape, _) in layout.tensors("tp").items():
+            _, n, k = shape
+            tail = (2, n // 2 * k) if name.startswith("w13") else (n, k)
+            # NCCL and strided copies must preserve FP8 storage bits exactly.
+            ep = a.view(f"ep.{layer}.{name}").view(torch.uint8)
+            tp = a.view(f"tp.{layer}.{name}").view(torch.uint8)
+            staging = a.view(f"scratch.{name}").view(torch.uint8)
+            tail = (tail[0], tail[1] * a.entries[f"ep.{layer}.{name}"].dtype.itemsize)
             if target == "tp":
                 staging.view(t, e, *tail).copy_(
                     ep.view(e, tail[0], t, tail[1]).permute(2, 0, 1, 3)
@@ -187,7 +186,8 @@ class WeightTransfer:
         a, layout = self.arena, self.arena.layout
         source = "ep" if target == "tp" else "tp"
         suffix = "v2" if target == "tp" else "ep"
-        for name in ("w13", "w2"):
+        for name, (shape, dtype) in layout.tensors("tp").items():
+            _, n, k = shape
             args = [
                 self.buffer.data_ptr(),
                 self.peer_pointers,
@@ -197,19 +197,15 @@ class WeightTransfer:
                 layout.expert_tp_size,
                 layout.experts // layout.ep_size,
             ]
-            if name == "w13":
-                args.extend(
-                    [layout.intermediate // layout.expert_tp_size * layout.hidden, 2, 2]
-                )
+            if name.startswith("w13"):
+                kernel_name = "w13_" + suffix
+                args.extend([n // 2 * k, 2, dtype.itemsize])
             else:
+                kernel_name = "w2_" + suffix
                 args.extend(
-                    [
-                        layout.hidden,
-                        layout.intermediate * 2,
-                        layout.intermediate // layout.expert_tp_size * 2,
-                    ]
+                    [n, k * layout.expert_tp_size * dtype.itemsize, k * dtype.itemsize]
                 )
-            getattr(self.kernel, name + "_" + suffix)(*args, self.stream.cuda_stream)
+            getattr(self.kernel, kernel_name)(*args, self.stream.cuda_stream)
 
     def close(self):
         self.stream.synchronize()

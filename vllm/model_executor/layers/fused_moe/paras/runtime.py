@@ -16,10 +16,13 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import set_weight_attrs
 
 from .storage import ExpertArena, ExpertLayout
@@ -83,8 +86,61 @@ class ParasRoutedExperts(RoutedExperts):
 
     def _get_quant_method(self, prefix, quant_config, moe_config):
         if quant_config is not None:
-            raise ValueError("PARAS quantization is not implemented")
+            return ManagedFp8MoEMethod(quant_config, self, self.paras_mode, prefix)
         return ManagedMoEMethod(moe_config, self.paras_mode, prefix)
+
+
+class ManagedFp8MoEMethod(Fp8MoEMethod):
+    def __init__(self, quant_config, layer, mode, layer_name):
+        if (
+            not isinstance(quant_config, Fp8Config)
+            or not quant_config.is_checkpoint_fp8_serialized
+            or quant_config.activation_scheme != "dynamic"
+            or quant_config.weight_block_size != [128, 128]
+            or quant_config.store_dtype is not None
+            or layer.moe_config.has_bias
+            or is_layer_skipped(
+                prefix=layer_name,
+                ignored_layers=quant_config.ignored_layers,
+                fused_mapping=quant_config.packed_modules_mapping,
+                match_mode=quant_config.ignored_layers_match_mode,
+            )
+        ):
+            raise ValueError("PARAS requires unbiased, serialized block FP8 experts")
+        super().__init__(quant_config, layer)
+        if self.fp8_backend == Fp8MoeBackend.DEEPGEMM:
+            from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+                DeepGemmExperts,
+            )
+
+            # Honor explicit expert TP selection, including narrow TP shards.
+            self.experts_cls = DeepGemmExperts
+        self.mode = mode
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer_name)
+        if match is None:
+            raise ValueError(f"Unknown expert layer name: {layer_name}")
+        self.layer_id = int(match.group(1))
+
+    def create_weights(self, layer, *args, **attrs):
+        # Reuse checkpoint loader metadata without allocating temporary weights.
+        with torch.device("meta"):
+            super().create_weights(layer, *args, **attrs)
+        arena = get_runtime().arena
+        for name, param_name in arena.layout.parameter_names.items():
+            original = getattr(layer, param_name)
+            tensor = arena.view(f"{self.mode}.{self.layer_id}.{name}")
+            if tensor.shape != original.shape or tensor.dtype != original.dtype:
+                raise ValueError(f"Managed {name} differs from FP8 checkpoint layout")
+            param = torch.nn.Parameter(tensor, requires_grad=False)
+            set_weight_attrs(param, original.__dict__)
+            layer.register_parameter(param_name, param)
+
+    def process_weights_after_loading(self, layer):
+        names = get_runtime().arena.layout.parameter_names.values()
+        before = {name: getattr(layer, name).data_ptr() for name in names}
+        super().process_weights_after_loading(layer)
+        if before != {name: getattr(layer, name).data_ptr() for name in names}:
+            raise RuntimeError("FP8 backend replaced managed expert weights or scales")
 
 
 @dataclasses.dataclass
@@ -107,7 +163,7 @@ class ParasRuntime:
         self.config = config
         config.paras_config.validate(config)
         layout = ExpertLayout.from_model(
-            config.model_config.hf_text_config,
+            config.model_config.hf_config,
             ep_size=config.parallel_config.data_parallel_size,
             expert_tp_size=config.paras_config.expert_tp_size,
         )
@@ -170,7 +226,7 @@ class ParasRuntime:
                 ep.moe_config,
                 moe_parallel_config=tp_parallel,
                 num_local_experts=ep.global_num_experts,
-                moe_backend="triton",
+                moe_backend=self.config.paras_config.expert_tp_backend,
                 intermediate_size_per_partition_unpadded=None,
             )
             mapping = ExpertMapManager(
@@ -210,13 +266,13 @@ class ParasRuntime:
                 ep.layer_name,
                 ep.params_dtype,
                 cfg,
-                None,
+                ep.quant_config,
                 expert_map_manager=mapping,
                 paras_mode="tp",
                 **kwargs,
             )
             tp.quant_method.process_weights_after_loading(tp)
-            assert isinstance(ep.quant_method, ManagedMoEMethod)
+            assert isinstance(ep.quant_method, (ManagedMoEMethod, ManagedFp8MoEMethod))
             self.states.append(MoEStates(runner, ep, tp, ep.quant_method.layer_id))
         if (
             tuple(sorted(s.layer_id for s in self.states))
@@ -235,13 +291,16 @@ class ParasRuntime:
         for state in self.states:
             for mode in ("ep", "tp"):
                 experts = getattr(state, mode)
-                for name in ("w13", "w2"):
-                    tensor = getattr(experts, name + "_weight")
+                for name, param_name in self.arena.layout.parameter_names.items():
+                    tensor = getattr(experts, param_name)
+                    view = self.arena.view(f"{mode}.{state.layer_id}.{name}")
                     if (
-                        tensor.data_ptr()
-                        != self.arena.view(f"{mode}.{state.layer_id}.{name}").data_ptr()
+                        tensor.data_ptr() != view.data_ptr()
+                        or tensor.dtype != view.dtype
+                        or tensor.shape != view.shape
+                        or tensor.stride() != view.stride()
                     ):
-                        raise RuntimeError("Managed weight address changed")
+                        raise RuntimeError("Managed weight or scale storage changed")
 
         if self.stationary_state is not None:
             self.stationary_state.check()
@@ -342,6 +401,12 @@ class ParasRuntime:
             "rank": get_dp_group().rank_in_group,
             "expert_ranks": self.expert_ranks,
             "arena_bytes": self.arena.nbytes,
+            "weight_dtype": str(self.arena.layout.weight_dtype),
+            "weight_block_size": self.arena.layout.weight_block_size,
+            "expert_moe_backends": {
+                "ep": self.config.kernel_config.moe_backend,
+                "tp": self.config.paras_config.expert_tp_backend,
+            },
             "expert_layer_indices": self.arena.layout.layer_indices,
             "shared_expert_layers": sum(
                 s.runner.shared_experts is not None for s in self.states

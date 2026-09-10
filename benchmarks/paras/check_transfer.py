@@ -16,14 +16,14 @@ from vllm.model_executor.layers.fused_moe.paras.storage import ExpertArena, Expe
 from vllm.model_executor.layers.fused_moe.paras.transfer import WeightTransfer
 
 
-def pattern(shape, layer, weight, expert_start, intermediate_start, mode, device):
-    # Use integer arithmetic, then reinterpret all BF16 bit patterns. This catches
-    # element permutations (including gate/up and row/column ordering) exactly.
-    e, h, i = (shape[0], shape[2], shape[1] // 2) if weight == "w13" else shape
+def pattern(shape, layer, weight, expert_start, intermediate_start, dtype, device):
+    # Reinterpret integer patterns to catch permutations, including FP8 NaN bits.
+    gated = weight.startswith("w13")
+    e, h, i = (shape[0], shape[2], shape[1] // 2) if gated else shape
     expert = torch.arange(e, device=device, dtype=torch.int32) + expert_start
     hidden = torch.arange(h, device=device, dtype=torch.int32)
     inter = torch.arange(i, device=device, dtype=torch.int32) + intermediate_start
-    if weight == "w13":
+    if gated:
         gates = torch.stack((inter, inter + 2003)).reshape(-1)
         value = (
             expert[:, None, None] * 53
@@ -36,7 +36,8 @@ def pattern(shape, layer, weight, expert_start, intermediate_start, mode, device
             + hidden[None, :, None] * 17
             + inter[None, None, :] * 71
         )
-    return (value + layer * 97).to(torch.int16).view(torch.bfloat16)
+    bits = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[dtype.itemsize]
+    return (value + layer * 97).to(bits).view(dtype)
 
 
 def main():
@@ -65,7 +66,7 @@ def main():
     arena.materialize(f"cuda:{rank}")
     transfer = WeightTransfer(arena, args.method, dist.group.WORLD, gpu_group)
     for layer in layout.layer_indices:
-        for weight in ("w13", "w2"):
+        for weight in layout.parameter_names:
             target = arena.view(f"ep.{layer}.{weight}")
             target.copy_(
                 pattern(
@@ -74,7 +75,7 @@ def main():
                     weight,
                     rank * (layout.experts // size),
                     0,
-                    "ep",
+                    target.dtype,
                     target.device,
                 )
             )
@@ -87,19 +88,24 @@ def main():
             times[mode].append(transfer.move(mode))
             if iteration in (0, args.rounds - 1):
                 for layer in layout.layer_indices:
-                    for weight in ("w13", "w2"):
+                    for weight in layout.parameter_names:
                         target = arena.view(f"{mode}.{layer}.{weight}")
+                        inter = (
+                            target.shape[1] // 2
+                            if weight.startswith("w13")
+                            else target.shape[2]
+                        )
                         expected = pattern(
                             target.shape,
                             layer,
                             weight,
                             rank * (layout.experts // size) if mode == "ep" else 0,
-                            rank * (layout.intermediate // size) if mode == "tp" else 0,
-                            mode,
+                            rank * inter if mode == "tp" else 0,
+                            target.dtype,
                             target.device,
                         )
                         if not torch.equal(
-                            target.view(torch.int16), expected.view(torch.int16)
+                            target.view(torch.uint8), expected.view(torch.uint8)
                         ):
                             raise AssertionError(
                                 f"rank={rank} {mode}.{layer}.{weight} mismatch"

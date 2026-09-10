@@ -34,13 +34,19 @@ class StaticProbe:
                         "w13_address": module.w13_weight.data_ptr(),
                         "w2_address": module.w2_weight.data_ptr(),
                         "method": type(module.quant_method).__name__,
+                        "weight_dtype": str(module.w13_weight.dtype),
+                        "fp8_backend": getattr(
+                            getattr(module.quant_method, "fp8_backend", None),
+                            "name",
+                            None,
+                        ),
                     }
                 )
         from vllm.model_executor.layers.fused_moe.paras.state import StationaryState
         from vllm.model_executor.layers.fused_moe.paras.storage import ExpertLayout
 
         layout = ExpertLayout.from_model(
-            self.vllm_config.model_config.hf_text_config,
+            self.vllm_config.model_config.hf_config,
             ep_size=get_dp_group().world_size,
             expert_tp_size=get_dp_group().world_size,
         )

@@ -123,6 +123,7 @@ void launch_peer_access_fused_transfer_w13_v2(
 // EP layout: (E_local, H, I_full) with TP split on last dim.
 // For peer r, copies columns [r*I_prime, (r+1)*I_prime) — contiguous within
 // each row.
+template <typename Vec>
 __global__ void peer_access_fused_transfer_w2_v2(
     const char* __restrict__ local_buffer,
     char* const* __restrict__ peer_buffers, int64_t src_ep_offset,
@@ -142,7 +143,7 @@ __global__ void peer_access_fused_transfer_w2_v2(
   char* const dst_buf =
       (peer == tp_rank) ? const_cast<char*>(local_buffer) : peer_buffers[peer];
 
-  const int n_int4_per_row_dst = I_prime_bytes >> 4;  // I_prime_bytes / 16
+  const int n_int4_per_row_dst = I_prime_bytes / sizeof(Vec);
   const int peer_shard_byte_off = peer * I_prime_bytes;
   const int64_t total_int4 = (int64_t)E_local * H * n_int4_per_row_dst;
 
@@ -170,16 +171,16 @@ __global__ void peer_access_fused_transfer_w2_v2(
         // Source: EP[e, h, peer*I_prime + col] — strided rows
         const int64_t src_off = src_ep_offset + (int64_t)e * H * I_full_bytes +
                                 (int64_t)h * I_full_bytes +
-                                peer_shard_byte_off + col * 16;
+                                peer_shard_byte_off + col * sizeof(Vec);
 
         // Dest: TP[(tp_rank*E_local+e), h, col]
         const int64_t dst_off =
             dst_tp_offset +
             (int64_t)(tp_rank * E_local + e) * H * I_prime_bytes +
-            (int64_t)h * I_prime_bytes + col * 16;
+            (int64_t)h * I_prime_bytes + col * sizeof(Vec);
 
-        *reinterpret_cast<int4*>(dst_buf + dst_off) =
-            __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
+        *reinterpret_cast<Vec*>(dst_buf + dst_off) =
+            __ldg(reinterpret_cast<const Vec*>(local_buffer + src_off));
       }
     }
     pos += stride;
@@ -199,10 +200,21 @@ void launch_peer_access_fused_transfer_w2_v2(
   const int blocks = num_sms * tp_size;
   const int threads = 256;
 
-  peer_access_fused_transfer_w2_v2<<<blocks, threads, 0, stream>>>(
-      reinterpret_cast<const char*>(local_buffer_ptr),
-      reinterpret_cast<char* const*>(peer_buffer_ptrs), src_ep_offset,
-      dst_tp_offset, tp_rank, tp_size, E_local, H, I_full_bytes, I_prime_bytes);
+  if (I_prime_bytes % 16 == 0) {
+    peer_access_fused_transfer_w2_v2<int4><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs), src_ep_offset,
+        dst_tp_offset, tp_rank, tp_size, E_local, H, I_full_bytes,
+        I_prime_bytes);
+  } else {
+    TORCH_CHECK(I_prime_bytes > 0 && I_prime_bytes % 4 == 0,
+                "Peer transfer rows must be aligned to four bytes");
+    peer_access_fused_transfer_w2_v2<uint32_t><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs), src_ep_offset,
+        dst_tp_offset, tp_rank, tp_size, E_local, H, I_full_bytes,
+        I_prime_bytes);
+  }
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -325,6 +337,7 @@ void launch_peer_access_fused_transfer_w13_ep(
 // Dest:   peer's EP slot[i+1], layout (E_local, H, I_full) — TP split on last
 // dim. For peer r, reads experts [r*E_local, (r+1)*E_local) from local TP slot,
 // writes tp_rank's column shard to peer r's EP slot.
+template <typename Vec>
 __global__ void peer_access_fused_transfer_w2_ep(
     const char* __restrict__ local_buffer,
     char* const* __restrict__ peer_buffers, int64_t src_tp_offset,
@@ -344,7 +357,7 @@ __global__ void peer_access_fused_transfer_w2_ep(
   char* const dst_buf =
       (peer == tp_rank) ? const_cast<char*>(local_buffer) : peer_buffers[peer];
 
-  const int n_int4_per_row = I_prime_bytes >> 4;  // I_prime_bytes / 16
+  const int n_int4_per_row = I_prime_bytes / sizeof(Vec);
   const int tp_rank_shard_byte_off = tp_rank * I_prime_bytes;
   const int64_t total_int4 = (int64_t)E_local * H * n_int4_per_row;
 
@@ -372,15 +385,15 @@ __global__ void peer_access_fused_transfer_w2_ep(
         // Source: TP[(peer*E_local+e), h, col] — rows of width I'
         const int64_t src_off =
             src_tp_offset + (int64_t)(peer * E_local + e) * H * I_prime_bytes +
-            (int64_t)h * I_prime_bytes + col * 16;
+            (int64_t)h * I_prime_bytes + col * sizeof(Vec);
 
         // Dest: peer's EP[e, h, tp_rank*I' + col] — rows of width I_full
         const int64_t dst_off = dst_ep_offset + (int64_t)e * H * I_full_bytes +
                                 (int64_t)h * I_full_bytes +
-                                tp_rank_shard_byte_off + col * 16;
+                                tp_rank_shard_byte_off + col * sizeof(Vec);
 
-        *reinterpret_cast<int4*>(dst_buf + dst_off) =
-            __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
+        *reinterpret_cast<Vec*>(dst_buf + dst_off) =
+            __ldg(reinterpret_cast<const Vec*>(local_buffer + src_off));
       }
     }
     pos += stride;
@@ -400,10 +413,21 @@ void launch_peer_access_fused_transfer_w2_ep(
   const int blocks = num_sms * tp_size;
   const int threads = 256;
 
-  peer_access_fused_transfer_w2_ep<<<blocks, threads, 0, stream>>>(
-      reinterpret_cast<const char*>(local_buffer_ptr),
-      reinterpret_cast<char* const*>(peer_buffer_ptrs), src_tp_offset,
-      dst_ep_offset, tp_rank, tp_size, E_local, H, I_full_bytes, I_prime_bytes);
+  if (I_prime_bytes % 16 == 0) {
+    peer_access_fused_transfer_w2_ep<int4><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs), src_tp_offset,
+        dst_ep_offset, tp_rank, tp_size, E_local, H, I_full_bytes,
+        I_prime_bytes);
+  } else {
+    TORCH_CHECK(I_prime_bytes > 0 && I_prime_bytes % 4 == 0,
+                "Peer transfer rows must be aligned to four bytes");
+    peer_access_fused_transfer_w2_ep<uint32_t><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs), src_tp_offset,
+        dst_ep_offset, tp_rank, tp_size, E_local, H, I_full_bytes,
+        I_prime_bytes);
+  }
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
