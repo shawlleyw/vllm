@@ -445,6 +445,24 @@ class Worker(WorkerBase):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)
 
+    def paras_status(self):
+        return self.model_runner.paras.status()
+
+    def paras_prepare(self, target: str, epoch: int):
+        batch = self.model_runner.input_batch
+        requests = [
+            {
+                "id": req_id,
+                "computed_tokens": int(batch.num_computed_tokens_cpu[i]),
+                "prompt_tokens": int(batch.num_prompt_tokens[i]),
+            }
+            for i, req_id in enumerate(batch.req_ids)
+        ]
+        return self.model_runner.paras.prepare(target, epoch, requests)
+
+    def paras_commit(self, target: str, epoch: int):
+        return self.model_runner.paras.commit(target, epoch)
+
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:

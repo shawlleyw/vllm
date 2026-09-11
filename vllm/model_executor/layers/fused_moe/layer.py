@@ -368,6 +368,18 @@ def FusedMoEFactory(
 
     # Create RoutedExperts instance BEFORE create_weights()
     # This will hold all expert weight parameters
+    if vllm_config.paras_config is not None:
+        from vllm.model_executor.layers.fused_moe.paras.runtime import (
+            ParasRoutedExperts,
+        )
+
+        if num_fused_shared_experts:
+            raise ValueError(
+                "PARAS requires shared experts separate from routed storage"
+            )
+        if routed_experts_cls is not None or quant_config is not None:
+            raise ValueError("PARAS requires standard unquantized routed experts")
+        routed_experts_cls = ParasRoutedExperts
     if routed_experts_cls is None:
         routed_experts_cls = RoutedExperts
 

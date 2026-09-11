@@ -210,6 +210,11 @@ def build_app(
 
     register_vllm_serve_api_routers(app)
 
+    if getattr(args, "paras_config", None) is not None:
+        from vllm.entrypoints.serve.paras.api_router import router as paras_router
+
+        app.include_router(paras_router)
+
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
     )

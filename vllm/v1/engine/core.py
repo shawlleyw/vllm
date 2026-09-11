@@ -2041,8 +2041,8 @@ class DPEngineCoreProc(EngineCoreProc):
         consensus checkpoint in ``_has_global_unfinished_reqs``.
 
         Phase 2 (in ``_has_global_unfinished_reqs``): Once the all-reduce
-        confirms that **all** ranks have ``pending_pause`` set, collectively
-        stop stepping and set ``ignore_start_dp_wave`` so that stale
+        confirms that **all** ranks requested a pause and retired their async
+        batches, collectively stop stepping and set ``ignore_start_dp_wave`` so stale
         ``START_DP_WAVE`` messages cannot re-wake any engine.
         """
         self.pending_pause = True
@@ -2216,13 +2216,20 @@ class DPEngineCoreProc(EngineCoreProc):
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        # PARAS needs a bounded quiescence point after the current execution.
+        # All ranks use the same fixed cadence, including idle/dummy steps.
+        sync_interval = 1 if self.vllm_config.paras_config is not None else 32
+        if self.step_counter % sync_interval != 0:
             return True
 
+        # A paused scheduler retains requests but reports no schedulable work.
+        # Async batches must still retire their outputs before any rank can
+        # acknowledge the pause and start changing expert weights.
+        batches_pending = bool(self.batch_queue)
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
-            has_unfinished=local_unfinished,
-            pending_pause=self.pending_pause,
+            has_unfinished=local_unfinished or batches_pending,
+            pending_pause=self.pending_pause and not batches_pending,
         )
 
         if pause_consensus:

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+mode=${1:?Usage: launch_static.sh ep|tp [output-directory]}
+case "$mode" in
+  ep) experts=(--enable-expert-parallel --all2all-backend deepep_low_latency --moe-backend batched_triton) ;;
+  tp) experts=(--no-enable-expert-parallel --all2all-backend allgather_reducescatter --moe-backend triton) ;;
+  *) echo "Mode must be ep or tp" >&2; exit 2 ;;
+esac
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+out=${2:-/data/shaoyuw/paras/vllm-milestone/runs/$mode}
+mkdir -p "$out"
+out=$(realpath "$out")
+export CUDA_VISIBLE_DEVICES="${PARAS_GPUS:?Set PARAS_GPUS explicitly, e.g. 4,5,6,7 for four ranks}"
+IFS=, read -ra paras_devices <<< "$CUDA_VISIBLE_DEVICES"
+paras_size=${#paras_devices[@]}
+export VLLM_USE_V2_MODEL_RUNNER=0
+export CUDA_HOME=/usr/local/cuda-13.0
+export OMP_NUM_THREADS=1
+export TORCH_CUDA_ARCH_LIST=8.0
+export MAX_JOBS=4
+export NVSHMEM_REMOTE_TRANSPORT=none
+export NVSHMEM_IB_ENABLE_IBGDA=0
+export NVSHMEM_QP_DEPTH=2048
+[[ -d .venv/conda-meta ]]
+export PATH="$PWD/.venv/bin:$PATH"
+export PYTHONPATH="$PWD/benchmarks/paras"
+export NVSHMEM_DIR="$PWD/.venv/lib/python3.12/site-packages/nvidia/nvshmem"
+export LD_LIBRARY_PATH="$NVSHMEM_DIR/lib:$PWD/.venv/lib/python3.12/site-packages/nvidia/nccl/lib"
+export VLLM_NCCL_SO_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2"
+export VLLM_CACHE_ROOT="${PARAS_CACHE_ROOT:-$out/cache}"
+export VLLM_SERVER_DEV_MODE=1
+export HF_HUB_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+nvidia-smi --query-gpu=index,uuid,name,memory.used,utilization.gpu --format=csv > "$out/gpus-before.csv"
+.venv/bin/python benchmarks/paras/check_gpus.py
+paras_attention_config=${PARAS_ATTENTION_CONFIG:-'{"flash_attn_version":2}'}
+paras_compilation_config='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32,64]}'
+if [[ "${PARAS_REFERENCE_NUMERICS:-0}" == 1 ]]; then
+  paras_compilation_config='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32,64],"inductor_compile_config":{"deterministic":true,"benchmark_fusion":false,"combo_kernels":false,"benchmark_combo_kernel":false,"emulate_precision_casts":true}}'
+fi
+args=("${PARAS_MODEL:-/data/shaoyuw/models/Qwen3-30B-A3B}"
+  --host 127.0.0.1 --port "${PARAS_PORT:-8765}" --served-model-name paras-qwen --api-server-count 1
+  --dtype bfloat16 --tensor-parallel-size 1 --data-parallel-size "$paras_size"
+  --data-parallel-backend mp --distributed-executor-backend mp
+  --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 512
+  --gpu-memory-utilization "${PARAS_MEMORY_UTILIZATION:-0.85}" --enable-chunked-prefill --enable-prefix-caching
+  --no-enable-dbo --no-enable-eplb --no-enable-elastic-ep
+  --attention-config "$paras_attention_config"
+  --compilation-config "$paras_compilation_config"
+  --worker-extension-cls "${PARAS_WORKER_EXTENSION:-static_probe.StaticProbe}"
+  --profiler-config.profiler torch
+  --profiler-config.torch_profiler_dir "$out/profiles"
+  --profiler-config.torch_profiler_with_stack false
+  --profiler-config.ignore_frontend true
+  --cudagraph-metrics --seed 0)
+case "${PARAS_ASYNC_SCHEDULING:-1}" in
+  1) args+=(--async-scheduling) ;;
+  0) args+=(--no-async-scheduling) ;;
+  *) echo "PARAS_ASYNC_SCHEDULING must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ "${PARAS_SCHEDULER_TRACE:-0}" == 1 ]]; then
+  [[ "${PARAS_ASYNC_SCHEDULING:-1}" == 1 ]]
+  export PARAS_SCHEDULER_TRACE_DIR="$out/scheduler"
+  args+=(--scheduler-cls async_probe.AsyncProbeScheduler)
+fi
+if [[ -n "${PARAS_MAMBA_CACHE_MODE:-}" ]]; then
+  args+=(--mamba-cache-mode "$PARAS_MAMBA_CACHE_MODE")
+fi
+if [[ "${PARAS_LANGUAGE_MODEL_ONLY:-0}" == 1 ]]; then
+  args+=(--language-model-only)
+fi
+if [[ -n "${PARAS_TRANSPORT:-}" ]]; then
+  [[ "$mode" == ep ]]
+  args+=(--paras-config "{\"expert_tp_size\":$paras_size,\"weight_transfer_method\":\"$PARAS_TRANSPORT\"}")
+fi
+printf '%q ' .venv/bin/python -m vllm.entrypoints.cli.main serve "${args[@]}" "${experts[@]}" > "$out/command.txt"
+printf '\n' >> "$out/command.txt"
+.venv/bin/python -m vllm.entrypoints.cli.main serve "${args[@]}" "${experts[@]}" 2>&1 | tee "$out/server.log"

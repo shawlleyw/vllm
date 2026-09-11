@@ -182,6 +182,12 @@ class EngineClient(ABC):
         """Load a new LoRA adapter into the engine for future requests."""
         ...
 
+    async def paras_status(self) -> dict:
+        raise NotImplementedError
+
+    async def paras_switch(self, target: str) -> dict:
+        raise NotImplementedError
+
     @abstractmethod
     async def pause_generation(
         self,

@@ -109,6 +109,10 @@ class AsyncLLM(EngineClient):
         # Ensure we can serialize custom transformer configs
         maybe_register_config_serialize_by_value()
 
+        self._paras_lock = asyncio.Lock()
+        self._paras_failed = False
+        self._paras_tasks: set[asyncio.Task] = set()
+        self._paras_last_timings: dict[str, float] = {}
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
         self.model_config = vllm_config.model_config
@@ -787,6 +791,72 @@ class AsyncLLM(EngineClient):
         )
         await self.engine_core.add_request_async(request)
 
+    async def paras_status(self) -> dict:
+        if self.vllm_config.paras_config is None:
+            raise RuntimeError("PARAS is not configured")
+        async with self._paras_lock:
+            return await self._paras_status()
+
+    async def _paras_status(self) -> dict:
+        result = await self.collective_rpc("paras_status")
+        while isinstance(result, list):
+            result = result[0]
+        result["failed"] = result["failed"] or self._paras_failed
+        result["last_timings"].update(self._paras_last_timings)
+        return result
+
+    async def paras_switch(self, target: str) -> dict:
+        if self.vllm_config.paras_config is None or target not in ("ep", "tp"):
+            raise ValueError("PARAS must be configured; target must be ep or tp")
+        task = asyncio.create_task(self._paras_switch(target))
+        self._paras_tasks.add(task)
+        task.add_done_callback(self._paras_tasks.discard)
+        # Keep the transaction alive even if its HTTP client disconnects.
+        return await asyncio.shield(task)
+
+    async def _paras_switch(self, target: str) -> dict:
+        async with self._paras_lock:
+            started = time.perf_counter()
+            current = await self._paras_status()
+            if current["failed"]:
+                raise RuntimeError("PARAS failed; restart the engine before resuming")
+            if current["mode"] == target:
+                return dict(current, noop=True)
+            epoch = current["epoch"] + 1
+            await self.pause_generation(mode="keep", clear_cache=False)
+            paused = time.perf_counter()
+            try:
+                await self.collective_rpc(
+                    "paras_prepare", timeout=60, args=(target, epoch)
+                )
+                prepared = time.perf_counter()
+            except BaseException:
+                await self.resume_generation()
+                raise
+            self._paras_failed = True
+            try:
+                await self.collective_rpc(
+                    "paras_commit", timeout=60, args=(target, epoch)
+                )
+                committed = time.perf_counter()
+            except BaseException as exc:
+                raise RuntimeError(
+                    "PARAS transfer failed after destructive phase began; "
+                    "execution remains stopped and the engine must restart"
+                ) from exc
+            self._paras_failed = False
+            await self.resume_generation()
+            resumed = time.perf_counter()
+            self._paras_last_timings = {
+                "pause_ms": (paused - started) * 1000,
+                "prepare_ms": (prepared - paused) * 1000,
+                "commit_rpc_ms": (committed - prepared) * 1000,
+                "resume_ms": (resumed - committed) * 1000,
+                "complete_switch_ms": (resumed - started) * 1000,
+            }
+            result = await self._paras_status()
+            return dict(result, noop=False)
+
     async def pause_generation(
         self,
         *,
@@ -834,6 +904,8 @@ class AsyncLLM(EngineClient):
 
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
+        if self._paras_failed:
+            raise RuntimeError("Cannot resume after a destructive PARAS failure")
         await self.engine_core.resume_scheduler_async()
 
     async def is_paused(self) -> bool:
