@@ -31,6 +31,20 @@ from .transfer import WeightTransfer
 _runtime = None
 
 
+@torch.no_grad()
+def initialize_tp_scales(ep, tp, group):
+    """Reshard block scales once, into separately owned TP parameters."""
+    size = dist.get_world_size(group)
+    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        source = getattr(ep, name)
+        target = getattr(tp, name)
+        e = source.shape[0]
+        _, n, k = target.shape
+        tail = (2, n // 2 * k) if name.startswith("w13") else (n, k)
+        send = source.view(e, tail[0], size, tail[1]).permute(2, 0, 1, 3)
+        dist.all_to_all_single(target.view(-1), send.contiguous().view(-1), group=group)
+
+
 def get_runtime():
     global _runtime
     if _runtime is None:
@@ -135,12 +149,25 @@ class ManagedFp8MoEMethod(Fp8MoEMethod):
             set_weight_attrs(param, original.__dict__)
             layer.register_parameter(param_name, param)
 
+            scale_name = f"{name}_{self.weight_scale_name}"
+            original_scale = getattr(layer, scale_name)
+            scale = torch.nn.Parameter(
+                torch.ones(
+                    original_scale.shape,
+                    dtype=original_scale.dtype,
+                    device=tensor.device,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(scale, original_scale.__dict__)
+            layer.register_parameter(scale_name, scale)
+
     def process_weights_after_loading(self, layer):
         names = get_runtime().arena.layout.parameter_names.values()
         before = {name: getattr(layer, name).data_ptr() for name in names}
         super().process_weights_after_loading(layer)
         if before != {name: getattr(layer, name).data_ptr() for name in names}:
-            raise RuntimeError("FP8 backend replaced managed expert weights or scales")
+            raise RuntimeError("FP8 backend replaced managed expert weights")
 
 
 @dataclasses.dataclass
@@ -271,6 +298,8 @@ class ParasRuntime:
                 paras_mode="tp",
                 **kwargs,
             )
+            if isinstance(ep.quant_method, ManagedFp8MoEMethod):
+                initialize_tp_scales(ep, tp, self.transfer_group)
             tp.quant_method.process_weights_after_loading(tp)
             assert isinstance(ep.quant_method, (ManagedMoEMethod, ManagedFp8MoEMethod))
             self.states.append(MoEStates(runner, ep, tp, ep.quant_method.layer_id))
@@ -300,7 +329,7 @@ class ParasRuntime:
                         or tensor.shape != view.shape
                         or tensor.stride() != view.stride()
                     ):
-                        raise RuntimeError("Managed weight or scale storage changed")
+                        raise RuntimeError("Managed weight storage changed")
 
         if self.stationary_state is not None:
             self.stationary_state.check()

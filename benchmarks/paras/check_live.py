@@ -240,6 +240,9 @@ async def main(args):
             assert first["kv_addresses"] == last["kv_addresses"], "KV moved"
             assert first["stationary_tensors"] == last["stationary_tensors"]
             assert first["all_weight_addresses"] == last["all_weight_addresses"]
+            assert (
+                first["expert_scales"] == warm["expert_scales"] == last["expert_scales"]
+            ), "Resident EP/TP scale tensors changed"
             assert len(last["stationary_transfer_checks"]) == 6
             assert all(check["passed"] for check in last["stationary_transfer_checks"])
             assert first["counters"] == last["counters"], (

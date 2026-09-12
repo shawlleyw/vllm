@@ -8,10 +8,12 @@ import math
 import os
 import statistics
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 
+from vllm.model_executor.layers.fused_moe.paras.runtime import initialize_tp_scales
 from vllm.model_executor.layers.fused_moe.paras.storage import ExpertArena, ExpertLayout
 from vllm.model_executor.layers.fused_moe.paras.transfer import WeightTransfer
 
@@ -65,6 +67,48 @@ def main():
     arena = ExpertArena(layout, args.method)
     arena.materialize(f"cuda:{rank}")
     transfer = WeightTransfer(arena, args.method, dist.group.WORLD, gpu_group)
+    resident_scales = {}
+    if layout.weight_block_size:
+        for layer in layout.layer_indices:
+            ep, tp = SimpleNamespace(), SimpleNamespace()
+            for weight, shape in zip(("w13", "w2"), layout.shapes("ep")):
+                e, n, k = shape
+                source = pattern(
+                    (e, n // 128, k // 128),
+                    layer,
+                    weight,
+                    rank * (layout.experts // size),
+                    0,
+                    torch.float32,
+                    arena.buffer.device,
+                )
+                _, tp_n, tp_k = layout.tensors("tp")[weight][0]
+                target = torch.empty(
+                    (layout.experts, tp_n // 128, tp_k // 128),
+                    device=source.device,
+                    dtype=torch.float32,
+                )
+                setattr(ep, f"{weight}_weight_scale_inv", source)
+                setattr(tp, f"{weight}_weight_scale_inv", target)
+            initialize_tp_scales(ep, tp, gpu_group)
+            for mode, scales in (("ep", ep), ("tp", tp)):
+                for weight in ("w13", "w2"):
+                    tensor = getattr(scales, f"{weight}_weight_scale_inv")
+                    inter = tensor.shape[1] // 2 if weight == "w13" else tensor.shape[2]
+                    expected = pattern(
+                        tensor.shape,
+                        layer,
+                        weight,
+                        rank * (layout.experts // size) if mode == "ep" else 0,
+                        rank * inter if mode == "tp" else 0,
+                        tensor.dtype,
+                        tensor.device,
+                    )
+                    assert torch.equal(
+                        tensor.view(torch.uint8), expected.view(torch.uint8)
+                    )
+                    assert not arena.is_managed(tensor)
+                    resident_scales[f"{mode}.{layer}.{weight}"] = (tensor, expected)
     for layer in layout.layer_indices:
         for weight in layout.parameter_names:
             target = arena.view(f"ep.{layer}.{weight}")
@@ -115,6 +159,8 @@ def main():
                     flush=True,
                 )
     assert pointers == {k: v.data_ptr() for k, v in arena.views.items()}
+    for name, (tensor, expected) in resident_scales.items():
+        assert torch.equal(tensor.view(torch.uint8), expected.view(torch.uint8)), name
     results = {
         "rank": rank,
         "world_size": size,
@@ -124,6 +170,7 @@ def main():
         "model": args.model,
         "arena_bytes": arena.nbytes,
         "exact_roundtrip": "passed",
+        "resident_scale_tensors": len(resident_scales),
         "times_ms": times,
         "summary": {
             mode: {

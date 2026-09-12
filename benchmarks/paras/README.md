@@ -19,15 +19,19 @@ shared experts, and recurrent/KV state keep their existing placement.
 The FP8 launcher uses `--moe-backend triton`; vLLM selects its batched variant
 for DeepEP automatically.
 
-The managed arena includes FP8 weights and their FP32 block scales. Both are
-resharded together without requantization or a persistent BF16 expert copy.
-At TP8, down-projection scale rows contain one FP32 value; the peer transfer
-kernel supports these four-byte rows. NCCL transfers use byte views to preserve
-the exact FP8 representations. Unsupported quantization formats, ignored routed
-experts, and TP partitions that split a quantization block are rejected.
+The managed arena contains only FP8 weights. Each EP and TP layer owns its FP32
+block-scale parameters separately on GPU. Initialization redistributes the loaded
+EP scales into the TP parameters once, before preparing the TP kernels. Switching
+then moves only weights and selects the destination's existing scales, without
+requantization or a persistent BF16 expert copy. Scales do not participate in arena
+reservations, scratch buffers, or peer transfer kernels. NCCL weight transfers use
+byte views to preserve the exact FP8 representations. Unsupported quantization
+formats, ignored routed experts, and TP partitions that split a quantization block
+are rejected.
 
 The local environment from the H800 setup below can run all 48 layers on GPUs
-0–7. The expert arena uses approximately 13.785 GiB per GPU. Model configuration,
+0–7. The expert arena uses approximately 13.781 GiB per GPU; both resident scale
+sets together use 6.75 MiB per GPU. Model configuration,
 tokenizer, and processor files are under `.venv/models/Qwen3.5-122B-A10B-FP8`;
 the launcher defaults to dummy weights and text-only inference:
 
@@ -63,8 +67,10 @@ curl -fsS http://127.0.0.1:8765/paras/switch \
   -H 'Content-Type: application/json' -d '{"target":"ep"}'
 ```
 
-Run the existing transport checker with `--model` to include the checkpoint's
-scale tensors in the bit-exact round trip. Run the live checker with
+Run the existing transport checker with `--model` to check the one-time TP scale
+initialization, bit-exact weight round trips, and preservation of both scale sets.
+The live checker also compares scale addresses, layouts, and hashes before and
+after switches. Run it with
 `--world-size 8`. Dummy runs validate execution and transfer correctness;
 evaluation with the trained checkpoint is still required to assess model quality.
 
@@ -72,17 +78,22 @@ Validated on eight H800s with all 48 layers and dummy weights:
 
 - Triton/Triton and DeepGEMM/DeepGEMM each passed 95 completed requests, one
   cancellation, and 36 live mode changes, including partial prefill and queued
-  decode. KV/recurrent state and weight/scale storage remained stable.
+  decode. KV/recurrent state and weight storage remained stable. All 192 resident
+  scale tensors per rank retained their addresses, layouts, and hashes outside
+  the expert arena.
 - Both configurations preserved all 32×248,320 captured logits bit for bit after
   an EP→TP→EP round trip with matching token histories.
 - Profiler traces confirmed graph replay on every rank and actual DeepGEMM
   grouped expert kernels in both EP and TP.
-- FP8 weight/scale and BF16 regression transfers passed bit-exact checks over
-  both peer access and NCCL. The CPU regression suite passed 71 tests; Ruff,
+- FP8 and BF16 regression weight transfers passed bit-exact checks over
+  both peer access and NCCL; one-time TP scale initialization and scale preservation
+  also passed. The CPU regression suite passed 72 tests; Ruff,
   clang-format, and ShellCheck passed.
 
-Results are summarized in `.venv/var/paras/fp8-validation.json`, with detailed
-artifacts in `qwen122b-fp8-switch` and `qwen122b-fp8-deepgemm` under that directory.
+Resident-scale results are summarized in
+`.venv/var/paras/resident-scales/summary.json`, with detailed artifacts in the
+`triton` and `deep_gemm` subdirectories. The earlier shared-scale validation is
+recorded in `.venv/var/paras/fp8-validation.json`.
 
 ### Local H800 setup under `/opt/tiger/vllm`
 

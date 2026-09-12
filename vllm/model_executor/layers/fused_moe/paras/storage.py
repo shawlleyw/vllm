@@ -52,15 +52,6 @@ class ExpertLayout:
                 raise ValueError("PARAS FP8 requires 128x128 weight blocks")
             if self.hidden % 128 or (self.intermediate // self.expert_tp_size) % 128:
                 raise ValueError("FP8 expert TP shards must align to 128x128 blocks")
-            scale_chunk_bytes = (
-                self.intermediate
-                // self.expert_tp_size
-                // 128
-                * (self.hidden // 128)
-                * 4
-            )
-            if scale_chunk_bytes % 16:
-                raise ValueError("FP8 gate/up scale shards must align to 16 bytes")
         if (self.intermediate // self.expert_tp_size * self.weight_dtype.itemsize) % 16:
             raise ValueError("Peer transfer rows must be multiples of 16 bytes")
 
@@ -122,20 +113,11 @@ class ExpertLayout:
 
     @property
     def parameter_names(self) -> dict[str, str]:
-        names = {"w13": "w13_weight", "w2": "w2_weight"}
-        if self.weight_block_size:
-            names.update(
-                w13_scale="w13_weight_scale_inv", w2_scale="w2_weight_scale_inv"
-            )
-        return names
+        return {"w13": "w13_weight", "w2": "w2_weight"}
 
     def tensors(self, mode: str) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
         w13, w2 = self.shapes(mode)
-        tensors = {"w13": (w13, self.weight_dtype), "w2": (w2, self.weight_dtype)}
-        if self.weight_block_size:
-            for name, (e, n, k) in (("w13_scale", w13), ("w2_scale", w2)):
-                tensors[name] = ((e, n // 128, k // 128), torch.float32)
-        return tensors
+        return {"w13": (w13, self.weight_dtype), "w2": (w2, self.weight_dtype)}
 
     def shapes(self, mode: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
         if mode not in ("ep", "tp"):

@@ -65,15 +65,20 @@ def test_actual_qwen_shape_budget_and_replica_guard(size):
         ExpertLayout(48, 128, 2048, 768, ep_size=4, expert_tp_size=2)
 
 
-def test_qwen122b_fp8_scales_follow_tp8_block_boundaries():
+def test_qwen122b_fp8_arena_reserves_only_weights():
     layout = ExpertLayout(48, 256, 3072, 1024, 8, 8, weight_block_size=(128, 128))
     tensors = layout.tensors("tp")
     assert tensors["w13"] == ((256, 256, 3072), torch.float8_e4m3fn)
-    assert tensors["w13_scale"] == ((256, 2, 24), torch.float32)
-    assert tensors["w2_scale"] == ((256, 24, 1), torch.float32)
+    assert set(tensors) == {"w13", "w2"}
     arena = ExpertArena(layout, "peer_access")
-    assert arena.slab_bytes == 288 * 2**20 + 72 * 2**10
+    assert arena.slab_bytes == 288 * 2**20
     assert arena.nbytes == 49 * arena.slab_bytes
+    assert all(entry.dtype == torch.float8_e4m3fn for entry in arena.entries.values())
+
+
+def test_fp8_scale_rows_do_not_constrain_weight_transfer_alignment():
+    layout = ExpertLayout(1, 8, 128, 1024, 8, 8, weight_block_size=(128, 128))
+    assert layout.shapes("tp") == ((8, 256, 128), (8, 128, 128))
 
 
 @pytest.mark.parametrize("intermediate,block", [(768, (128, 128)), (1024, (64, 128))])
@@ -200,7 +205,7 @@ def test_managed_registration_uses_original_layer_ids(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["ep", "tp"])
-def test_fp8_registration_binds_weights_and_scales_with_loader_metadata(
+def test_fp8_registration_keeps_scales_outside_arena_with_loader_metadata(
     monkeypatch, mode
 ):
     from types import SimpleNamespace
@@ -232,8 +237,17 @@ def test_fp8_registration_binds_weights_and_scales_with_loader_metadata(
         assert param.data_ptr() == arena.view(f"{mode}.0.{name}").data_ptr()
         assert param.dtype == layout.tensors(mode)[name][1]
         assert param.weight_loader is loader
-        if name.endswith("scale"):
-            assert param.quant_method == "block"
+    scales = [layer.w13_weight_scale_inv, layer.w2_weight_scale_inv]
+    assert [tuple(p.shape) for p in scales] == (
+        [(1, 16, 4), (1, 4, 8)] if mode == "ep" else [(8, 2, 4), (8, 4, 1)]
+    )
+    arena.buffer.fill_(255)
+    for param in scales:
+        assert param.device.type == "cpu"
+        assert param.dtype == torch.float32 and torch.all(param == 1)
+        assert not arena.is_managed(param)
+        assert param.weight_loader is loader
+        assert param.quant_method == "block"
     assert layer.w13_input_scale is None and layer.w2_input_scale is None
 
 

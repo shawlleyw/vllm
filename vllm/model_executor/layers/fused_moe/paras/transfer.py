@@ -161,7 +161,7 @@ class WeightTransfer:
         e, t = layout.experts // layout.ep_size, layout.expert_tp_size
         for name, (shape, _) in layout.tensors("tp").items():
             _, n, k = shape
-            tail = (2, n // 2 * k) if name.startswith("w13") else (n, k)
+            tail = (2, n // 2 * k) if name == "w13" else (n, k)
             # NCCL and strided copies must preserve FP8 storage bits exactly.
             ep = a.view(f"ep.{layer}.{name}").view(torch.uint8)
             tp = a.view(f"tp.{layer}.{name}").view(torch.uint8)
@@ -197,7 +197,7 @@ class WeightTransfer:
                 layout.expert_tp_size,
                 layout.experts // layout.ep_size,
             ]
-            if name.startswith("w13"):
+            if name == "w13":
                 kernel_name = "w13_" + suffix
                 args.extend([n // 2 * k, 2, dtype.itemsize])
             else:
