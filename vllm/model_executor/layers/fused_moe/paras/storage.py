@@ -26,6 +26,7 @@ class ExpertLayout:
     expert_tp_size: int
     # Original transformer layer IDs with routed experts; dense layers are omitted.
     layer_indices: tuple[int, ...] | None = None
+    weight_block_size: tuple[int, int] | None = None
 
     def __post_init__(self):
         if self.layer_indices is None:
@@ -46,13 +47,30 @@ class ExpertLayout:
             )
         if self.experts % self.ep_size or self.intermediate % self.expert_tp_size:
             raise ValueError("Experts and intermediate width must divide their groups")
-        if (self.intermediate // self.expert_tp_size * 2) % 16:
+        if self.weight_block_size is not None:
+            if tuple(self.weight_block_size) != (128, 128):
+                raise ValueError("PARAS FP8 requires 128x128 weight blocks")
+            if self.hidden % 128 or (self.intermediate // self.expert_tp_size) % 128:
+                raise ValueError("FP8 expert TP shards must align to 128x128 blocks")
+        if (self.intermediate // self.expert_tp_size * self.weight_dtype.itemsize) % 16:
             raise ValueError("Peer transfer rows must be multiples of 16 bytes")
 
     @classmethod
     def from_model(cls, hf_config, *, ep_size: int, expert_tp_size: int):
         # Multimodal wrappers describe the routed experts in their text config.
         config = getattr(hf_config, "text_config", None) or hf_config
+        quant = getattr(hf_config, "quantization_config", None)
+        if quant is None:
+            quant = getattr(config, "quantization_config", None)
+        block_size = None
+        if quant is not None:
+            if (
+                quant.get("quant_method") != "fp8"
+                or quant.get("activation_scheme") != "dynamic"
+                or quant.get("weight_block_size") != [128, 128]
+            ):
+                raise ValueError("PARAS supports BF16 or dynamic block FP8 checkpoints")
+            block_size = (128, 128)
         model_type = config.model_type
         indices = tuple(range(config.num_hidden_layers))
         if model_type in ("qwen2_moe", "qwen3_moe", "qwen3_next"):
@@ -86,7 +104,20 @@ class ExpertLayout:
             ep_size=ep_size,
             expert_tp_size=expert_tp_size,
             layer_indices=indices,
+            weight_block_size=block_size,
         )
+
+    @property
+    def weight_dtype(self) -> torch.dtype:
+        return torch.float8_e4m3fn if self.weight_block_size else torch.bfloat16
+
+    @property
+    def parameter_names(self) -> dict[str, str]:
+        return {"w13": "w13_weight", "w2": "w2_weight"}
+
+    def tensors(self, mode: str) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        w13, w2 = self.shapes(mode)
+        return {"w13": (w13, self.weight_dtype), "w2": (w2, self.weight_dtype)}
 
     def shapes(self, mode: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
         if mode not in ("ep", "tp"):
@@ -120,22 +151,23 @@ class ExpertArena:
         self.views: dict[str, torch.Tensor] = {}
         self.buffer: torch.Tensor | None = None
         self.nbytes = 0
-        w13, w2 = layout.shapes("ep")
-        self.w2_offset = align(prod(w13) * 2)
-        self.slab_bytes = self.w2_offset + align(prod(w2) * 2)
+        offsets = {}
+        self.slab_bytes = 0
+        for name, (shape, dtype) in layout.tensors("ep").items():
+            offsets[name] = self.slab_bytes
+            self.slab_bytes += align(prod(shape) * dtype.itemsize)
+        self.w2_offset = offsets["w2"]
         assert layout.layer_indices is not None
         for mode in ("ep", "tp"):
             for slot, layer_id in enumerate(layout.layer_indices):
                 base = (slot + (mode == "tp")) * self.slab_bytes
-                for name, shape, offset in zip(
-                    ("w13", "w2"), layout.shapes(mode), (base, base + self.w2_offset)
-                ):
+                for name, (shape, dtype) in layout.tensors(mode).items():
                     self.reserve(
-                        f"{mode}.{layer_id}.{name}", shape, torch.bfloat16, offset
+                        f"{mode}.{layer_id}.{name}", shape, dtype, base + offsets[name]
                     )
         if transport == "nccl":
-            self.reserve("scratch.w13", w13, torch.bfloat16)
-            self.reserve("scratch.w2", w2, torch.bfloat16)
+            for name, (shape, dtype) in layout.tensors("ep").items():
+                self.reserve(f"scratch.{name}", shape, dtype)
 
     def reserve(self, name, shape, dtype, offset=None) -> None:
         if self.buffer is not None or name in self.entries:

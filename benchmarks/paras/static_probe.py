@@ -3,6 +3,7 @@
 """Opt-in worker diagnostics for the PARAS static baseline gate."""
 
 import dataclasses
+import hashlib
 import os
 import sys
 
@@ -34,13 +35,19 @@ class StaticProbe:
                         "w13_address": module.w13_weight.data_ptr(),
                         "w2_address": module.w2_weight.data_ptr(),
                         "method": type(module.quant_method).__name__,
+                        "weight_dtype": str(module.w13_weight.dtype),
+                        "fp8_backend": getattr(
+                            getattr(module.quant_method, "fp8_backend", None),
+                            "name",
+                            None,
+                        ),
                     }
                 )
         from vllm.model_executor.layers.fused_moe.paras.state import StationaryState
         from vllm.model_executor.layers.fused_moe.paras.storage import ExpertLayout
 
         layout = ExpertLayout.from_model(
-            self.vllm_config.model_config.hf_text_config,
+            self.vllm_config.model_config.hf_config,
             ep_size=get_dp_group().world_size,
             expert_tp_size=get_dp_group().world_size,
         )
@@ -83,6 +90,31 @@ class StaticProbe:
                 name: tensor.data_ptr()
                 for name, tensor in runner.paras.arena.views.items()
             }
+            snapshot["expert_scales"] = {}
+            for state in runner.paras.states:
+                for mode in ("ep", "tp"):
+                    experts = getattr(state, mode)
+                    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                        tensor = getattr(experts, name, None)
+                        if tensor is None:
+                            continue
+                        assert not runner.paras.arena.is_managed(tensor)
+                        raw = (
+                            tensor.detach()
+                            .cpu()
+                            .contiguous()
+                            .reshape(-1)
+                            .view(torch.uint8)
+                        )
+                        snapshot["expert_scales"][f"{mode}.{state.layer_id}.{name}"] = {
+                            "address": tensor.data_ptr(),
+                            "dtype": str(tensor.dtype),
+                            "shape": list(tensor.shape),
+                            "stride": list(tensor.stride()),
+                            "sha256": hashlib.sha256(
+                                memoryview(raw.numpy())
+                            ).hexdigest(),
+                        }
         # DP utility calls return only the first engine's result to HTTP.
         # Gather diagnostics on the CPU group so that result includes both ranks.
         snapshots = [None] * get_dp_group().world_size

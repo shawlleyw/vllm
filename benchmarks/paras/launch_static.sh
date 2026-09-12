@@ -3,26 +3,25 @@
 set -euo pipefail
 mode=${1:?Usage: launch_static.sh ep|tp [output-directory]}
 case "$mode" in
-  ep) experts=(--enable-expert-parallel --all2all-backend deepep_low_latency --moe-backend batched_triton) ;;
-  tp) experts=(--no-enable-expert-parallel --all2all-backend allgather_reducescatter --moe-backend triton) ;;
+  ep) experts=(--enable-expert-parallel --all2all-backend deepep_low_latency --moe-backend "${PARAS_EP_MOE_BACKEND:-batched_triton}") ;;
+  tp) experts=(--no-enable-expert-parallel --all2all-backend allgather_reducescatter --moe-backend "${PARAS_TP_MOE_BACKEND:-triton}") ;;
   *) echo "Mode must be ep or tp" >&2; exit 2 ;;
 esac
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-out=${2:-/data/shaoyuw/paras/vllm-milestone/runs/$mode}
+out=${2:-$PWD/.venv/var/paras/runs/$mode}
 mkdir -p "$out"
 out=$(realpath "$out")
 export CUDA_VISIBLE_DEVICES="${PARAS_GPUS:?Set PARAS_GPUS explicitly, e.g. 4,5,6,7 for four ranks}"
 IFS=, read -ra paras_devices <<< "$CUDA_VISIBLE_DEVICES"
 paras_size=${#paras_devices[@]}
 export VLLM_USE_V2_MODEL_RUNNER=0
-export CUDA_HOME=/usr/local/cuda-13.0
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export OMP_NUM_THREADS=1
-export TORCH_CUDA_ARCH_LIST=8.0
 export MAX_JOBS=4
 export NVSHMEM_REMOTE_TRANSPORT=none
 export NVSHMEM_IB_ENABLE_IBGDA=0
 export NVSHMEM_QP_DEPTH=2048
-[[ -d .venv/conda-meta ]]
+[[ -x .venv/bin/python ]]
 export PATH="$PWD/.venv/bin:$PATH"
 export PYTHONPATH="$PWD/benchmarks/paras"
 export NVSHMEM_DIR="$PWD/.venv/lib/python3.12/site-packages/nvidia/nvshmem"
@@ -30,7 +29,7 @@ export LD_LIBRARY_PATH="$NVSHMEM_DIR/lib:$PWD/.venv/lib/python3.12/site-packages
 export VLLM_NCCL_SO_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2"
 export VLLM_CACHE_ROOT="${PARAS_CACHE_ROOT:-$out/cache}"
 export VLLM_SERVER_DEV_MODE=1
-export HF_HUB_OFFLINE=1
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export TOKENIZERS_PARALLELISM=false
 nvidia-smi --query-gpu=index,uuid,name,memory.used,utilization.gpu --format=csv > "$out/gpus-before.csv"
 .venv/bin/python benchmarks/paras/check_gpus.py
@@ -54,6 +53,9 @@ args=("${PARAS_MODEL:-/data/shaoyuw/models/Qwen3-30B-A3B}"
   --profiler-config.torch_profiler_with_stack false
   --profiler-config.ignore_frontend true
   --cudagraph-metrics --seed 0)
+if [[ -n "${PARAS_LOAD_FORMAT:-}" ]]; then
+  args+=(--load-format "$PARAS_LOAD_FORMAT")
+fi
 case "${PARAS_ASYNC_SCHEDULING:-1}" in
   1) args+=(--async-scheduling) ;;
   0) args+=(--no-async-scheduling) ;;
@@ -72,7 +74,7 @@ if [[ "${PARAS_LANGUAGE_MODEL_ONLY:-0}" == 1 ]]; then
 fi
 if [[ -n "${PARAS_TRANSPORT:-}" ]]; then
   [[ "$mode" == ep ]]
-  args+=(--paras-config "{\"expert_tp_size\":$paras_size,\"weight_transfer_method\":\"$PARAS_TRANSPORT\"}")
+  args+=(--paras-config "{\"expert_tp_size\":$paras_size,\"weight_transfer_method\":\"$PARAS_TRANSPORT\",\"expert_tp_backend\":\"${PARAS_TP_MOE_BACKEND:-triton}\"}")
 fi
 printf '%q ' .venv/bin/python -m vllm.entrypoints.cli.main serve "${args[@]}" "${experts[@]}" > "$out/command.txt"
 printf '\n' >> "$out/command.txt"

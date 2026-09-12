@@ -13,6 +13,8 @@ class ParasConfig:
     """Explicit expert TP ranks (2, 4, or 8); must equal the attention DP size."""
     weight_transfer_method: Literal["peer_access", "nccl"] = "peer_access"
     """Transport used to reshard the managed routed expert weights."""
+    expert_tp_backend: Literal["triton", "deep_gemm"] = "triton"
+    """Expert TP kernel backend. EP uses the configured moe_backend."""
 
     def compute_hash(self) -> str:
         return hash_factors(get_hash_factors(self, set()))
@@ -45,11 +47,16 @@ class ParasConfig:
             "EP startup with DeepEP low latency": (
                 p.enable_expert_parallel and p.all2all_backend == "deepep_low_latency"
             ),
-            "batched Triton EP experts": (
-                vllm_config.kernel_config.moe_backend == "batched_triton"
+            "supported expert kernels": (
+                vllm_config.kernel_config.moe_backend in ("triton", "deep_gemm")
+                if m is not None and m.quantization == "fp8"
+                else vllm_config.kernel_config.moe_backend == "batched_triton"
+                and self.expert_tp_backend == "triton"
             ),
-            "unquantized BF16 routed experts": (
-                m is not None and m.dtype == torch.bfloat16 and m.quantization is None
+            "BF16 activations with BF16 or block FP8 routed experts": (
+                m is not None
+                and m.dtype == torch.bfloat16
+                and m.quantization in (None, "fp8")
             ),
             "V1 model runner": not envs.VLLM_USE_V2_MODEL_RUNNER,
             "no DBO/EPLB/elastic EP": not (
@@ -69,10 +76,25 @@ class ParasConfig:
         if failures:
             raise ValueError("PARAS requires " + ", ".join(failures))
 
+        if "deep_gemm" in (
+            vllm_config.kernel_config.moe_backend,
+            self.expert_tp_backend,
+        ):
+            from vllm.platforms import current_platform
+
+            if (
+                not current_platform.is_device_capability_family(90)
+                or envs.VLLM_USE_DEEP_GEMM_E8M0
+            ):
+                raise ValueError(
+                    "PARAS DeepGEMM requires Hopper and FP32 scales "
+                    "(VLLM_USE_DEEP_GEMM_E8M0=0) to preserve checkpoint weights"
+                )
+
         from vllm.model_executor.layers.fused_moe.paras.storage import ExpertLayout
 
         ExpertLayout.from_model(
-            m.hf_text_config,
+            m.hf_config,
             ep_size=p.data_parallel_size,
             expert_tp_size=self.expert_tp_size,
         )

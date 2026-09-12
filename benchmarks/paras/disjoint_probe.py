@@ -24,7 +24,7 @@ def disjoint_plan(self, layout, transport):
         )
     _plan(self, layout, transport)
     for layer in layout.layer_indices:
-        for name in ("w13", "w2"):
+        for name in layout.parameter_names:
             key = f"tp.{layer}.{name}"
             self.entries[key] = replace(
                 self.entries[key],

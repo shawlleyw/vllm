@@ -29,11 +29,12 @@ def main():
         index.strip(): (int(memory), int(utilization))
         for index, memory, utilization in rows
     }
+    idle_memory_limit = int(os.environ.get("PARAS_IDLE_MEMORY_MIB", "128"))
     for index in selected:
         if index not in available:
             raise SystemExit(f"Unknown GPU index {index}")
         memory, utilization = available[index]
-        if memory > 128 or utilization > 0:
+        if memory > idle_memory_limit or utilization > 0:
             raise SystemExit(f"GPU {index} is busy: {memory} MiB, {utilization}%")
     # A GPU can report zero utilization yet reject contexts after a memory error.
     # This process exits before the server starts, releasing every test context.

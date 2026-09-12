@@ -8,17 +8,183 @@ vLLM `2cf0a6915ce544dc493a0990f2ea38d81601128a` (v0.28.0).
 
 ## Environment
 
+### FP8 EP8 ↔ TP8: Qwen3.5-122B-A10B
+
+PARAS supports serialized E4M3 FP8 experts with dynamic activation quantization
+and 128×128 weight blocks, as used by
+[Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8).
+Activations outside the FP8 kernels remain BF16. By default, EP uses DeepEP low latency and
+batched Triton; expert TP uses Triton with AllGather/ReduceScatter. Attention,
+shared experts, and recurrent/KV state keep their existing placement.
+The FP8 launcher uses `--moe-backend triton`; vLLM selects its batched variant
+for DeepEP automatically.
+
+The managed arena contains only FP8 weights. Each EP and TP layer owns its FP32
+block-scale parameters separately on GPU. Initialization redistributes the loaded
+EP scales into the TP parameters once, before preparing the TP kernels. Switching
+then moves only weights and selects the destination's existing scales, without
+requantization or a persistent BF16 expert copy. Scales do not participate in arena
+reservations, scratch buffers, or peer transfer kernels. NCCL weight transfers use
+byte views to preserve the exact FP8 representations. Unsupported quantization
+formats, ignored routed experts, and TP partitions that split a quantization block
+are rejected.
+
+The local environment from the H800 setup below can run all 48 layers on GPUs
+0–7. The expert arena uses approximately 13.781 GiB per GPU; both resident scale
+sets together use 6.75 MiB per GPU. Model configuration,
+tokenizer, and processor files are under `.venv/models/Qwen3.5-122B-A10B-FP8`;
+the launcher defaults to dummy weights and text-only inference:
+
+```bash
+benchmarks/paras/run_qwen122b_fp8.sh
+```
+
+Use `run_qwen122b_fp8.sh ep` or `run_qwen122b_fp8.sh tp` for static baselines.
+Set one option to use DeepGEMM for both EP and expert TP:
+
+```bash
+PARAS_MOE_BACKEND=deep_gemm benchmarks/paras/run_qwen122b_fp8.sh
+```
+
+`PARAS_MOE_BACKEND=triton` selects Triton for both (the default).
+`PARAS_EP_MOE_BACKEND` and `PARAS_TP_MOE_BACKEND` optionally override each mode.
+DeepGEMM switching currently requires Hopper and FP32 block scales. The launcher
+sets `VLLM_USE_DEEP_GEMM_E8M0=0` for DeepGEMM so initialization preserves the
+checkpoint's weights and scales. PARAS's TP state selects DeepGEMM directly, including
+narrow shards that vLLM's usual selector would route to Triton. The CLI equivalent
+uses `--moe-backend deep_gemm` and
+`--paras-config '{"expert_tp_size":8,"expert_tp_backend":"deep_gemm"}'`.
+Static TP baselines retain vLLM's usual shape-based backend selection.
+
+For real weights, supply a local copy of the checkpoint and set
+`PARAS_LOAD_FORMAT=auto`. The switch API is unchanged:
+
+```bash
+curl -fsS http://127.0.0.1:8765/paras/status
+curl -fsS http://127.0.0.1:8765/paras/switch \
+  -H 'Content-Type: application/json' -d '{"target":"tp"}'
+curl -fsS http://127.0.0.1:8765/paras/switch \
+  -H 'Content-Type: application/json' -d '{"target":"ep"}'
+```
+
+Run the existing transport checker with `--model` to check the one-time TP scale
+initialization, bit-exact weight round trips, and preservation of both scale sets.
+The live checker also compares scale addresses, layouts, and hashes before and
+after switches. Run it with
+`--world-size 8`. Dummy runs validate execution and transfer correctness;
+evaluation with the trained checkpoint is still required to assess model quality.
+
+Validated on eight H800s with all 48 layers and dummy weights:
+
+- Triton/Triton and DeepGEMM/DeepGEMM each passed 95 completed requests, one
+  cancellation, and 36 live mode changes, including partial prefill and queued
+  decode. KV/recurrent state and weight storage remained stable. All 192 resident
+  scale tensors per rank retained their addresses, layouts, and hashes outside
+  the expert arena.
+- Both configurations preserved all 32×248,320 captured logits bit for bit after
+  an EP→TP→EP round trip with matching token histories.
+- Profiler traces confirmed graph replay on every rank and actual DeepGEMM
+  grouped expert kernels in both EP and TP.
+- FP8 and BF16 regression weight transfers passed bit-exact checks over
+  both peer access and NCCL; one-time TP scale initialization and scale preservation
+  also passed. The CPU regression suite passed 72 tests; Ruff,
+  clang-format, and ShellCheck passed.
+
+Resident-scale results are summarized in
+`.venv/var/paras/resident-scales/summary.json`, with detailed artifacts in the
+`triton` and `deep_gemm` subdirectories. The earlier shared-scale validation is
+recorded in `.venv/var/paras/fp8-validation.json`.
+
+### Local H800 setup under `/opt/tiger/vllm`
+
+The local Python 3.12 environment is a uv venv at `.venv`. It uses the
+upstream v0.28.0 native extensions, PyTorch CUDA 13.0 wheels, and the system
+CUDA toolkit at `/usr/local/cuda`. Recreate dependencies with
+`benchmarks/paras/setup_env.sh` (requires `uv` in `PATH` or `.tools/uv`).
+Build DeepEP with:
+
+```bash
+benchmarks/paras/build_deepep_hopper.sh /opt/tiger/DeepEP-v1
+```
+
+This builds DeepEP v1.2.1 in an isolated copy at `.venv/src/DeepEP-v1-hopper`,
+targeting SM90. It applies the existing local compatibility fixes to NVSHMEM
+library naming, IBGDA configuration, and the RDMA queue assertion. The original
+source is unchanged. The newer `/opt/tiger/DeepEP` checkout requires NCCL APIs
+absent from PyTorch's pinned NCCL version.
+
+Qwen3-30B-A3B configuration and tokenizer files are at
+`.venv/models/Qwen3-30B-A3B`. The following command starts the full 48-layer
+model with dummy weights on GPUs 0–3, initially in EP4 mode, with runtime
+switching to expert TP4. Attention stays at TP1/DP4 in both modes.
+
+```bash
+benchmarks/paras/run_qwen30b.sh
+```
+
+From another shell:
+
+```bash
+curl -fsS http://127.0.0.1:8765/paras/status
+curl -fsS http://127.0.0.1:8765/paras/switch \
+  -H 'Content-Type: application/json' -d '{"target":"tp"}'
+curl -fsS http://127.0.0.1:8765/paras/switch \
+  -H 'Content-Type: application/json' -d '{"target":"ep"}'
+```
+
+Use `run_qwen30b.sh ep` or `run_qwen30b.sh tp` for static baselines. Override
+`PARAS_GPUS` to select another four GPUs. The H800 environment allows up to
+2048 MiB of idle device memory to accommodate the host's `hold.py` reservation,
+while rejecting nonzero utilization. Outputs default to
+`.venv/var/paras/qwen30b-MODE`.
+Pause the existing `hold.py` GPU burn-in process before launching; it periodically
+uses all GPUs. Resume it after stopping the server if it is still needed.
+For real weights, provide a downloaded BF16 checkpoint:
+
+```bash
+PARAS_MODEL=/path/to/Qwen3-30B-A3B PARAS_LOAD_FORMAT=auto \
+  benchmarks/paras/run_qwen30b.sh
+```
+
+Dummy output is only useful for execution and switching checks. To run the
+existing four-rank DeepEP and live acceptance checks:
+
+```bash
+source benchmarks/paras/qwen30b_env.sh
+.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  benchmarks/paras/check_deepep.py
+# With the switching server running:
+.venv/bin/python benchmarks/paras/check_live.py --world-size 4 \
+  --output .venv/var/paras/qwen30b-switch
+.venv/bin/python benchmarks/paras/verify_replay.py --world-size 4 \
+  .venv/var/paras/qwen30b-switch
+```
+
+Validated on 2026-09-11 with Python 3.12.14, PyTorch 2.13.0+cu130,
+DeepEP 1.2.1, NCCL 2.29.7, and NVSHMEM 3.4.5. The four-rank DeepEP round trip
+and five graph replays passed. Live acceptance passed with async scheduling:
+83 completed requests, one cancellation, and 36 mode changes, including
+switches during queued decode and partial prefill. KV and weight addresses
+remained stable, and profiler traces confirmed graph replay in both modes on
+all four ranks. These checks used dummy weights and do not assess model quality.
+
+Results and logs are under `.venv/var/paras/qwen30b-switch`; the dependency
+snapshot is `.venv/requirements-paras.txt`. Ruff and ShellCheck passed for the
+modified Python and shell scripts.
+
+### Original A100 setup
+
 ```bash
 benchmarks/paras/setup_env.sh
 benchmarks/paras/build_deepep.sh /data/shaoyuw/paras/vllm-milestone/DeepEP-sm80
-conda activate /home/shaoyuw/vllm/.venv
+source .venv/bin/activate
 ```
 
-`setup_env.sh` creates a **conda** prefix at `.venv`, with Python 3.12 and uv,
+`setup_env.sh` creates a uv venv at `.venv`, with Python 3.12,
 installs editable vLLM and native extensions for the exact upstream commit, and
 installs pre-commit hooks. Python dependencies, NCCL, NVSHMEM, and the PARAS
 extension cache are inside this prefix. The system CUDA 13.0 toolkit supplies
-`nvcc`. Launchers replace inherited library paths with the conda paths.
+`nvcc`. Launchers replace inherited library paths with the venv paths.
 
 The DeepEP source is an isolated clone of the user-approved A100 port at
 `8e57c764c7d3fdb0999fe3e34a03371c8f53ae1b`. The vLLM Dockerfile's original pin
@@ -164,7 +330,7 @@ adding profiler traces to a live-suite run. These short workload measurements
 are smoke benchmarks, not saturation or production capacity estimates.
 
 Launchers bind localhost and enable development RPC/profiling only for these
-experiments. Runner V2, automatic switching, quantization, other model layouts,
+experiments. Runner V2, automatic switching, other quantization formats,
 multiple API processes, multiple TP replicas, and multi-node execution remain outside this
 milestone.
 
@@ -317,7 +483,8 @@ between MoE layers. Runtime states, reservations (for example, `ep.3.w13`), and
 transfer order use those IDs. Only the allocator uses compact slab positions. The shared factory retains each model's routing and
 separate shared-expert module. Attention TP remains 1, so dense MLPs and shared
 experts stay replicated and outside the arena. Fused shared-expert slots are
-rejected; quantization and context/pipeline parallelism remain unsupported.
+rejected; context/pipeline parallelism remains unsupported. Quantized expert
+switching is limited to the block FP8 layout described above.
 
 Layout metadata covers Qwen2/3 MoE, Qwen3-Next, Qwen3.5/3.6 MoE text configurations,
 GLM4 MoE/Lite, and DeepSeek V2/V3. A layout entry establishes weight geometry,
